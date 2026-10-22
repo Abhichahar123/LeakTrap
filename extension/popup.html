@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>LeakTrace</title>
+  <link rel="stylesheet" href="popup.css">
+  <script type="module" src="popup.js"></script>
+</head>
+<body>
+  <header>
+    <h1>LeakTrace</h1>
+    <p class="warning" role="note">Local development only. The backend has no user authentication.</p>
+    <p id="backend" class="hint"></p>
+  </header>
+
+  <main id="app">
+    <p id="not-configured" class="status" hidden>
+      No backend is configured, so nothing can be sent.
+      <button type="button" id="open-options">Open settings</button>
+    </p>
+
+    <section aria-labelledby="site-heading">
+      <h2 id="site-heading">This tab</h2>
+      <p id="current-site" class="site">Reading the current tab…</p>
+    </section>
+
+    <section id="autofill-section" aria-labelledby="autofill-heading" hidden>
+      <h2 id="autofill-heading">Autofill</h2>
+      <p class="hint">LeakTrace looks only at form fields on this tab, never fills anything until you click Fill, and never submits forms.</p>
+      <p id="autofill-status" class="status" role="status" aria-live="polite"></p>
+      <div id="autofill-fields"></div>
+      <div class="row">
+        <button type="button" id="autofill-lookup" hidden>Find my alias for this site</button>
+        <button type="button" id="autofill-allow" class="secondary" hidden>Allow suggestions on this site again</button>
+      </div>
+      <div id="autofill-suggestion"></div>
+      <p id="autofill-result" class="status" aria-live="polite"></p>
+    </section>
+
+    <section id="signup-section" aria-labelledby="signup-heading">
+      <h2 id="signup-heading">New signup marker</h2>
+      <form id="signup-form">
+        <label for="site-name">Website name</label>
+        <input id="site-name" name="site_name" maxlength="255" autocomplete="off" required>
+        <label for="site-domain">Website domain</label>
+        <input id="site-domain" name="site_domain" maxlength="253" autocomplete="off" required placeholder="example.com">
+        <label class="inline"><input type="checkbox" id="real-name"> This site requires my real name</label>
+        <label class="inline"><input type="checkbox" id="gen-nickname" checked> Generate a canary nickname</label>
+        <button type="submit">Review</button>
+      </form>
+      <div id="signup-confirm"></div>
+      <div id="signup-status" class="status" aria-live="polite"></div>
+      <div id="signup-result"></div>
+    </section>
+
+    <section id="receipt-section" aria-labelledby="receipt-heading">
+      <h2 id="receipt-heading">Consent receipt</h2>
+      <p class="warning" role="note">A receipt records what you report. LeakTrace does not verify it, and it is not proof of legally valid consent or of a legal violation.</p>
+      <div id="selected-signup"></div>
+      <form id="receipt-form">
+        <label for="receipt-signup">Signup ID</label>
+        <input id="receipt-signup" name="signup_id" type="number" min="1" step="1" required>
+        <p id="signup-mismatch" class="hint" role="status" hidden></p>
+        <label for="receipt-action">What you did</label>
+        <select id="receipt-action" name="action" required>
+          <option value="">Choose…</option>
+          <option value="accepted">Accepted</option>
+          <option value="declined">Declined</option>
+          <option value="notice_only">Only saw the notice</option>
+        </select>
+        <label for="receipt-url">Privacy notice URL (never fetched)</label>
+        <input id="receipt-url" name="source_url" type="url" maxlength="2048" autocomplete="off">
+        <button type="button" id="use-page-url" class="secondary">Use this tab's address (without query string)</button>
+        <label for="receipt-version">Notice version or date shown</label>
+        <input id="receipt-version" name="notice_version" maxlength="100" autocomplete="off">
+        <label for="receipt-notice">Notice text (paste, optional)</label>
+        <textarea id="receipt-notice" name="notice_text" rows="3" maxlength="20000"></textarea>
+        <label class="inline"><input type="checkbox" id="store-text"> Store the text (otherwise only its SHA-256 hash is sent)</label>
+        <label for="receipt-consent">Consent prompt wording (optional)</label>
+        <textarea id="receipt-consent" name="consent_text" rows="2" maxlength="2000"></textarea>
+        <label for="receipt-when">When it happened, if you know (your local time)</label>
+        <input id="receipt-when" name="occurred_at" type="datetime-local">
+        <button type="submit">Review</button>
+      </form>
+      <div id="receipt-confirm"></div>
+      <div id="receipt-status" class="status" aria-live="polite"></div>
+    </section>
+
+    <footer class="row">
+      <button type="button" id="open-dashboard" class="secondary">Open dashboard</button>
+      <button type="button" id="settings" class="secondary">Settings</button>
+    </footer>
+  </main>
+</body>
+</html>

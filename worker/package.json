@@ -1,0 +1,9 @@
+{
+  "name": "leaktrace-email-worker",
+  "private": true,
+  "type": "module",
+  "description": "Cloudflare Email Worker that forwards minimal message metadata to the LeakTrace backend.",
+  "scripts": {
+    "test": "node --test"
+  }
+}

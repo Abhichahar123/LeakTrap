@@ -1,0 +1,19 @@
+# LeakTrace email Worker. Not deployed automatically.
+# Email Routing rules that send mail to this Worker are configured manually in
+# the Cloudflare dashboard; this file defines no routes or triggers.
+name = "leaktrace-email"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+workers_dev = false
+
+[vars]
+# Only recipients exactly at this domain are processed.
+ALIAS_DOMAIN = "leaktrap.xyz"
+# Public HTTPS URL of the backend endpoint, e.g. "https://api.example.com/ingest/email".
+# Cloudflare cannot reach localhost. Must be https.
+INGEST_URL = ""
+# Optional: a verified Email Routing destination address that receives the
+# original message whenever the backend does not accept it.
+FALLBACK_ADDRESS = ""
+
+# Secret (never put it here): npx wrangler secret put INGEST_SECRET

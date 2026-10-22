@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LeakTrace extension settings</title>
+  <link rel="stylesheet" href="popup.css">
+  <script type="module" src="options.js"></script>
+</head>
+<body class="options">
+  <main>
+    <h1>LeakTrace extension settings</h1>
+    <p class="warning" role="note"><strong>Development setting.</strong> This version only talks to a LeakTrace backend on this computer (http://127.0.0.1). The backend has no user authentication, so this is not a production-ready setup. Whatever database that backend uses receives the records you create.</p>
+    <form id="settings-form">
+      <label for="base-url">Local backend URL</label>
+      <input id="base-url" name="base_url" type="url" placeholder="http://127.0.0.1:8000" autocomplete="off" required>
+      <p class="hint">Only <code>http://127.0.0.1:&lt;port&gt;</code> is accepted. Nothing is sent until you act in the popup.</p>
+      <div class="row">
+        <button type="submit">Save</button>
+        <button type="button" id="clear">Clear</button>
+      </div>
+    </form>
+    <p id="status" class="status" role="status" aria-live="polite"></p>
+    <h2>Autofill</h2>
+    <label class="inline"><input type="checkbox" id="autofill-enabled"> Offer to fill sign-up and login forms with my saved LeakTrace alias</label>
+    <p class="hint">Only runs on the tab where you open the LeakTrace popup. Every fill needs your click; forms are never submitted.</p>
+    <h3>Sites where you chose “Never”</h3>
+    <ul id="never-list"></ul>
+    <button type="button" id="never-clear" class="secondary">Clear the list</button>
+    <p id="autofill-status" class="status" role="status" aria-live="polite"></p>
+
+    <h2>What this extension stores</h2>
+    <ul>
+      <li>These settings (the backend URL, whether autofill is on, and the hostnames where you chose “Never”), in local extension storage.</li>
+      <li>The signup you last created or selected (ID, site, alias, nickname), in session storage, which is kept in memory and cleared when the browser closes. Use “Forget” in the popup to clear it sooner.</li>
+      <li>Nothing else: no browsing history, page content, form values, passwords, cookies or receipt text. Aliases are looked up from the backend when you ask, not saved per site.</li>
+    </ul>
+  </main>
+</body>
+</html>

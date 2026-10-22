@@ -1,0 +1,48 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local environment files (keep the example)
+.env
+.env.*
+!.env.example
+
+# Test caches and coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Local databases, dumps and backups
+*.db
+*.sqlite
+*.sqlite3
+*.dump
+*.backup
+*.bak
+*.sql.gz
+
+# Logs
+*.log
+logs/
+
+# Cloudflare Worker (local secrets and build output)
+node_modules/
+.wrangler/
+.dev.vars
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# Operating system
+.DS_Store
+Thumbs.db

@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "LeakTrace (local development)",
+  "version": "0.2.0",
+  "description": "Create LeakTrace signup markers, recall them to fill sign-up and login forms after you approve, and record consent receipts, using a LeakTrace backend running on this computer.",
+  "minimum_chrome_version": "116",
+  "action": {
+    "default_title": "LeakTrace",
+    "default_popup": "popup.html"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*"
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'none'; base-uri 'none'; connect-src http://127.0.0.1:*"
+  }
+}

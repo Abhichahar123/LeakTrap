@@ -1,0 +1,9 @@
+{
+  "name": "leaktrace-extension",
+  "private": true,
+  "type": "module",
+  "description": "LeakTrace browser extension (Manifest V3, local development only).",
+  "scripts": {
+    "test": "node --test"
+  }
+}

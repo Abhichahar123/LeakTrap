@@ -1,0 +1,122 @@
+"""Machine-to-machine email ingestion, called by the Cloudflare email Worker.
+
+Authenticated with a shared secret (LEAKTRACE_INGEST_SECRET) sent as a Bearer
+token. Responses and logs never repeat addresses, subjects or other input.
+"""
+
+import hmac
+import logging
+from dataclasses import dataclass
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
+from fastapi.concurrency import run_in_threadpool
+from pydantic import ValidationError
+from sqlalchemy.orm import Session
+
+from backend.config import settings
+from backend.database import get_db
+from backend.routes.common import read_limited_body, require_json, validation_error
+from backend.schemas.mail_ingest import MailIngestRequest, MailIngestResponse
+from backend.services import mail_ingest
+from backend.services.domains import normalize_domain
+
+logger = logging.getLogger("leaktrace.ingest")
+
+MIN_SECRET_LENGTH = 32
+
+router = APIRouter(prefix="/ingest", tags=["ingest"])
+
+
+@dataclass(frozen=True)
+class IngestConfig:
+    secret: str | None
+    max_bytes: int
+    alias_domain: str | None
+
+
+def get_ingest_config() -> IngestConfig:
+    """Ingestion settings for the request; tests override this dependency."""
+    return IngestConfig(settings.ingest_secret, settings.ingest_max_bytes, settings.alias_domain)
+
+
+def require_ingest_auth(
+    authorization: str | None = Header(default=None),
+    config: IngestConfig = Depends(get_ingest_config),
+) -> IngestConfig:
+    if not config.secret or len(config.secret) < MIN_SECRET_LENGTH:
+        logger.error("Email ingestion rejected: LEAKTRACE_INGEST_SECRET missing or too short")
+        raise HTTPException(503, "Email ingestion is not configured.")
+    scheme, _, token = (authorization or "").partition(" ")
+    if scheme.lower() != "bearer" or not hmac.compare_digest(
+        token.encode(), config.secret.encode()
+    ):
+        logger.warning("Email ingestion rejected: invalid or missing credentials")
+        raise HTTPException(
+            401, "Invalid or missing credentials.", headers={"WWW-Authenticate": "Bearer"}
+        )
+    return config
+
+
+@router.post(
+    "/email",
+    status_code=201,
+    response_model=MailIngestResponse,
+    responses={
+        200: {"description": "Already ingested (duplicate delivery); nothing changed"},
+        401: {"description": "Missing or invalid Bearer secret"},
+        413: {"description": "Body too large"},
+        415: {"description": "Body is not JSON"},
+        422: {"description": "Invalid payload or recipient outside the alias domain"},
+        503: {"description": "Ingestion or database not configured or unavailable"},
+    },
+    openapi_extra={"requestBody": {"required": True, "content": {"application/json": {
+        "schema": MailIngestRequest.model_json_schema()}}}},
+)
+async def ingest_email(
+    request: Request,
+    response: Response,
+    config: IngestConfig = Depends(require_ingest_auth),
+    db: Session = Depends(get_db),
+) -> MailIngestResponse:
+    """Record one inbound email and match it against the recipient alias's signups.
+
+    A match is never proof that a site leaked data. Safe to retry: a repeated
+    delivery returns 200 with status "duplicate" and stores nothing new.
+    """
+    require_json(request)
+    body = await read_limited_body(request, config.max_bytes)
+    try:
+        payload = MailIngestRequest.model_validate_json(body)
+    except ValidationError as exc:
+        raise validation_error(exc) from None
+
+    try:
+        alias_domain = normalize_domain(config.alias_domain or "")
+    except ValueError:
+        raise HTTPException(503, "Alias domain is not configured.") from None
+    if payload.recipient.split("@", 1)[1] != alias_domain:
+        raise HTTPException(422, "Recipient is not at the alias domain.")
+
+    mail = mail_ingest.InboundMail(
+        recipient=payload.recipient,
+        envelope_from=payload.envelope_from,
+        claimed_sender=mail_ingest.parse_from_header(payload.from_header),
+        subject=mail_ingest.decode_subject(payload.subject),
+        message_id=payload.message_id,
+        received_at=payload.received_at or mail_ingest.now(),
+    )
+    outcome = await run_in_threadpool(mail_ingest.process, db, mail)
+    logger.info(
+        "Ingested email: mail_log_id=%d duplicate=%s recipient_known=%s match=%s/%s",
+        outcome.mail_log_id, outcome.duplicate, outcome.recipient_known,
+        outcome.match_status, outcome.match_confidence,
+    )
+    if outcome.duplicate:
+        response.status_code = 200
+    return MailIngestResponse(
+        status="duplicate" if outcome.duplicate else "accepted",
+        mail_log_id=outcome.mail_log_id,
+        recipient_known=outcome.recipient_known,
+        match_status=outcome.match_status,
+        match_confidence=outcome.match_confidence,
+    )

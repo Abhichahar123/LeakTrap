@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LeakTrace Dashboard</title>
+  <link rel="stylesheet" href="/dashboard/static/styles.css">
+  <script src="/dashboard/static/app.js" defer></script>
+</head>
+<body>
+  <header class="top">
+    <h1>LeakTrace</h1>
+    <p class="banner" role="note">
+      <strong>Local development only.</strong> This dashboard has no authentication or
+      authorization and only answers requests from this machine. Do not expose it publicly.
+    </p>
+    <form id="scope-form" class="scope">
+      <label for="scope-user">User ID <span class="hint">(blank = records without a user)</span></label>
+      <input id="scope-user" name="user_id" type="number" min="1" step="1" inputmode="numeric">
+      <button type="submit">Apply</button>
+      <p id="scope-error" class="error" role="alert" hidden></p>
+    </form>
+  </header>
+
+  <nav class="tabs" role="tablist" aria-label="Dashboard sections">
+    <button role="tab" id="tab-overview" aria-controls="view-overview" aria-selected="true">Overview</button>
+    <button role="tab" id="tab-signups" aria-controls="view-signups" aria-selected="false" tabindex="-1">Signups</button>
+    <button role="tab" id="tab-emails" aria-controls="view-emails" aria-selected="false" tabindex="-1">Email activity</button>
+    <button role="tab" id="tab-check" aria-controls="view-check" aria-selected="false" tabindex="-1">Match check</button>
+    <button role="tab" id="tab-receipts" aria-controls="view-receipts" aria-selected="false" tabindex="-1">Consent receipts</button>
+  </nav>
+
+  <main>
+    <section id="view-overview" role="tabpanel" aria-labelledby="tab-overview">
+      <h2>Overview</h2>
+      <p class="notice" role="note">A match links a message to one of your signups. It is not proof that a site leaked, sold or shared your data.</p>
+      <div class="status" data-status aria-live="polite"></div>
+      <dl class="cards" id="overview-cards"></dl>
+    </section>
+
+    <section id="view-signups" role="tabpanel" aria-labelledby="tab-signups" hidden>
+      <h2>Signups</h2>
+      <p class="hint">Aliases are masked and nicknames are hidden.</p>
+      <div class="status" data-status aria-live="polite"></div>
+      <div class="table-wrap">
+        <table>
+          <caption class="sr-only">Signups, newest first</caption>
+          <thead><tr>
+            <th scope="col">Site</th><th scope="col">Domain</th><th scope="col">Alias</th>
+            <th scope="col">Markers</th><th scope="col">Emails</th><th scope="col">Created</th>
+          </tr></thead>
+          <tbody id="signups-body"></tbody>
+        </table>
+      </div>
+      <div class="pager" data-pager="signups"></div>
+    </section>
+
+    <section id="view-emails" role="tabpanel" aria-labelledby="tab-emails" hidden>
+      <h2>Email activity</h2>
+      <p class="hint">Message bodies, subjects and full sender addresses are never stored or shown. Sender domains are claims and can be forged.</p>
+      <label for="email-status">Filter by match status</label>
+      <select id="email-status">
+        <option value="">All</option>
+        <option value="matched">Matched</option>
+        <option value="ambiguous">Ambiguous</option>
+        <option value="no_match">No match</option>
+        <option value="unprocessed">Unprocessed</option>
+      </select>
+      <div class="status" data-status aria-live="polite"></div>
+      <div class="table-wrap">
+        <table>
+          <caption class="sr-only">Ingested emails, newest first</caption>
+          <thead><tr>
+            <th scope="col">Received</th><th scope="col">Status</th><th scope="col">Confidence</th>
+            <th scope="col">Signup / site</th><th scope="col">Sender domain</th><th scope="col"><span class="sr-only">Actions</span></th>
+          </tr></thead>
+          <tbody id="emails-body"></tbody>
+        </table>
+      </div>
+      <div class="pager" data-pager="emails"></div>
+      <section id="email-detail" class="detail" aria-labelledby="email-detail-title" tabindex="-1" hidden>
+        <h3 id="email-detail-title">Match details</h3>
+        <div id="email-detail-body"></div>
+        <button type="button" id="email-detail-close">Close details</button>
+      </section>
+    </section>
+
+    <section id="view-check" role="tabpanel" aria-labelledby="tab-check" hidden>
+      <h2>Match check</h2>
+      <p class="hint">Runs the matcher on clues you enter, in the selected scope. Nothing is saved.</p>
+      <form id="check-form" class="check">
+        <label for="check-recipient">Recipient address</label>
+        <input id="check-recipient" name="recipient" type="email" autocomplete="off">
+        <label for="check-sender">Sender address</label>
+        <input id="check-sender" name="sender" type="email" autocomplete="off">
+        <label for="check-subject">Subject</label>
+        <input id="check-subject" name="subject" type="text" maxlength="998" autocomplete="off">
+        <label for="check-nickname">Nickname the message used</label>
+        <input id="check-nickname" name="nickname" type="text" maxlength="100" autocomplete="off">
+        <label for="check-surname">Surname the message used</label>
+        <input id="check-surname" name="surname_variant" type="text" maxlength="100" autocomplete="off">
+        <button type="submit">Check</button>
+      </form>
+      <div class="status" data-status aria-live="polite"></div>
+      <div id="check-result"></div>
+    </section>
+
+    <section id="view-receipts" role="tabpanel" aria-labelledby="tab-receipts" hidden>
+      <h2>Consent receipts</h2>
+      <p class="notice" role="note">A receipt records what you reported. It does not prove that legally valid consent was given, that a site complied with data-protection law, or that a violation occurred.</p>
+      <p class="hint">All receipts here are entered manually and are user-reported; LeakTrace verifies none of them and never fetches policy URLs.</p>
+      <div class="status" data-status aria-live="polite"></div>
+      <div class="table-wrap">
+        <table>
+          <caption class="sr-only">Consent receipts, newest first</caption>
+          <thead><tr>
+            <th scope="col">Recorded by LeakTrace</th><th scope="col">Site</th><th scope="col">Reported action</th>
+            <th scope="col">Source</th><th scope="col">Evidence kept</th><th scope="col"><span class="sr-only">Actions</span></th>
+          </tr></thead>
+          <tbody id="receipts-body"></tbody>
+        </table>
+      </div>
+      <div class="pager" data-pager="receipts"></div>
+      <section id="receipt-detail" class="detail" aria-labelledby="receipt-detail-title" tabindex="-1" hidden>
+        <h3 id="receipt-detail-title">Receipt details</h3>
+        <div id="receipt-detail-body"></div>
+        <button type="button" id="receipt-detail-close">Close details</button>
+      </section>
+
+      <h3>Record a receipt</h3>
+      <form id="receipt-form" class="check">
+        <label for="receipt-signup">Signup ID</label>
+        <input id="receipt-signup" name="signup_id" type="number" min="1" step="1" required>
+        <label for="receipt-action">What you did</label>
+        <select id="receipt-action" name="action" required>
+          <option value="accepted">Accepted</option>
+          <option value="declined">Declined</option>
+          <option value="notice_only">Only saw the notice</option>
+        </select>
+        <label for="receipt-url">Privacy notice URL (not fetched)</label>
+        <input id="receipt-url" name="source_url" type="url" maxlength="2048" autocomplete="off">
+        <label for="receipt-version">Notice version or date shown</label>
+        <input id="receipt-version" name="notice_version" type="text" maxlength="100" autocomplete="off">
+        <label for="receipt-notice">Notice text (optional)</label>
+        <textarea id="receipt-notice" name="notice_text" rows="4" maxlength="20000"></textarea>
+        <label class="inline"><input id="receipt-store-text" type="checkbox"> Also store the notice text (otherwise only its SHA-256 hash is kept)</label>
+        <label for="receipt-consent">Consent prompt wording (optional)</label>
+        <textarea id="receipt-consent" name="consent_text" rows="2" maxlength="2000"></textarea>
+        <label for="receipt-occurred">When it happened, if you know (your local time)</label>
+        <input id="receipt-occurred" name="reported_occurred_at" type="datetime-local">
+        <button type="submit">Save receipt</button>
+      </form>
+      <div id="receipt-form-status" class="status" aria-live="polite"></div>
+    </section>
+  </main>
+</body>
+</html>
