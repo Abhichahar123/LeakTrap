@@ -19,7 +19,7 @@ from backend.config import (
     settings,
 )
 from backend.database import DatabaseNotConfiguredError
-from backend.routes import autofill, consent_receipts, dashboard, health, ingest, matcher, signups
+from backend.routes import auth, autofill, consent_receipts, dashboard, extension, health, ingest, matcher, signups
 
 logging.basicConfig(
     level=settings.log_level,
@@ -42,6 +42,9 @@ app = FastAPI(
 
 # Register routers here. Future phases add their routers alongside this one.
 app.include_router(health.router)
+app.include_router(auth.router)
+app.include_router(auth.account_router)
+app.include_router(extension.router)
 app.include_router(signups.router)
 app.include_router(matcher.router)
 app.include_router(ingest.router)

@@ -17,8 +17,10 @@ const shipped = files(root).map((path) => ({ path, text: readFileSync(path, "utf
 
 test("no secrets or database details in extension assets", () => {
   for (const { path, text } of shipped) {
-    for (const pattern of [/INGEST_SECRET/i, /Bearer\s/i, /postgres(ql)?(\+psycopg)?:\/\//i, /neon\.tech/i, /npg_/,
-      /DATABASE_URL/, /authorization/i, /api[_-]?key/i, /password\s*[:=]\s*["'`]/i]) {
+    // A runtime account token may be sent as `Bearer ${token}`; no literal token value may appear.
+    for (const pattern of [/INGEST_SECRET/i, /Bearer\s+(?!\$\{)[A-Za-z0-9._~+/-]{8,}/, /postgres(ql)?(\+psycopg)?:\/\//i,
+      /neon\.tech/i, /npg_/, /DATABASE_URL/, /api[_-]?key/i, /password\s*[:=]\s*["'`]/i, /lt_session/,
+      /authorization:\s*["'`](?!Bearer \$\{)/i]) {
       assert.ok(!pattern.test(text), `${path} matches ${pattern}`);
     }
   }

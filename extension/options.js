@@ -1,4 +1,6 @@
-import { normalizeNeverSites, removeNeverSite, validateBaseUrl } from "./src/lib.js";
+import {
+  ApiError, createApi, newPairingSecret, normalizeNeverSites, parseStoredAuth, removeNeverSite, sha256Hex, validateBaseUrl,
+} from "./src/lib.js";
 import { el, show } from "./src/dom.js";
 
 const form = document.getElementById("settings-form");
@@ -93,3 +95,101 @@ document.getElementById("never-clear").addEventListener("click", async () => {
     sayAutofill("Could not clear the list.", true);
   }
 });
+
+// ---------- account connection (dashboard-approved pairing) ----------
+
+const POLL_MS = 2000;
+const accountStatus = document.getElementById("account-status");
+const connectButton = document.getElementById("connect");
+const disconnectButton = document.getElementById("disconnect");
+const pairingNote = document.getElementById("pairing");
+let polling = null;
+
+function sayAccount(message, isError = false) {
+  accountStatus.textContent = message;
+  accountStatus.classList.toggle("error", isError);
+}
+
+async function savedApi(token = null) {
+  const { baseUrl } = await chrome.storage.local.get("baseUrl");
+  if (!baseUrl) throw new ApiError("Save the local backend URL above first.");
+  return createApi(baseUrl, globalThis.fetch, token);
+}
+
+async function showConnection() {
+  const { auth } = await chrome.storage.session.get("auth");
+  const current = parseStoredAuth(auth);
+  connectButton.hidden = Boolean(current);
+  disconnectButton.hidden = !current;
+  if (current) {
+    const until = new Date(current.expiresAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    sayAccount(`Connected as ${current.email} until ${until}.`);
+  } else {
+    if (auth) await chrome.storage.session.remove("auth");
+    sayAccount("Not connected.");
+  }
+}
+
+function stopPolling() {
+  clearTimeout(polling);
+  polling = null;
+  pairingNote.hidden = true;
+  pairingNote.textContent = "";
+  connectButton.disabled = false;
+}
+
+connectButton.addEventListener("click", async () => {
+  connectButton.disabled = true;
+  try {
+    const api = await savedApi();
+    const secret = newPairingSecret();
+    const pairing = await api.startPairing(await sha256Hex(secret));
+    pairingNote.hidden = false;
+    pairingNote.textContent = `Approve code ${pairing.code} in the dashboard tab that just opened. Only approve it if you see this same code here.`;
+    sayAccount("Waiting for approval in the dashboard…");
+    await chrome.tabs.create({ url: `${api.origin}${pairing.approvePath}` });
+    const poll = async () => {
+      if (Date.now() > pairing.expiresAt) {
+        stopPolling();
+        sayAccount("The code expired before it was approved. Try again.", true);
+        return;
+      }
+      try {
+        const result = await api.exchangePairing(pairing.pairingId, secret);
+        if (result.pending) {
+          polling = setTimeout(poll, POLL_MS);
+          return;
+        }
+        await chrome.storage.session.set({ auth: result });
+        stopPolling();
+        await showConnection();
+      } catch (error) {
+        stopPolling();
+        sayAccount(error instanceof ApiError ? error.message : "Connecting failed.", true);
+      }
+    };
+    polling = setTimeout(poll, POLL_MS);
+  } catch (error) {
+    stopPolling();
+    sayAccount(error instanceof ApiError ? error.message : "Connecting failed.", true);
+  }
+});
+
+disconnectButton.addEventListener("click", async () => {
+  const { auth } = await chrome.storage.session.get("auth");
+  const current = parseStoredAuth(auth);
+  try {
+    if (current) await (await savedApi(current.token)).disconnect();
+  } catch {
+    // Revocation failed (backend unreachable or token already invalid); forget it locally anyway.
+  }
+  await chrome.storage.session.remove("auth");
+  await showConnection();
+  sayAccount("Disconnected. This extension can no longer use your account.");
+});
+
+try {
+  await showConnection();
+} catch {
+  sayAccount("Could not read the connection state.", true);
+}

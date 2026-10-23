@@ -11,29 +11,38 @@ from sqlalchemy.orm import Session
 from backend.database import get_db
 from backend.main import app
 from backend.models import Incident, Signup, User
+from tests.auth_support import ORIGIN, make_account, sign_in
 
 pytestmark = pytest.mark.integration
 
 
 @pytest.fixture
-def client(session: Session):
+def accounts(session: Session) -> dict[str, User]:
+    return {"alice": make_account(session, "alice@example.com"), "bob": make_account(session, "bob@example.com")}
+
+
+@pytest.fixture
+def client(session: Session, accounts):
+    """Signed in as Alice."""
     app.dependency_overrides[get_db] = lambda: session
-    yield TestClient(app)
+    client = TestClient(app)
+    sign_in(client, session, accounts["alice"])
+    yield client
     app.dependency_overrides.clear()
 
 
 @pytest.fixture
-def signups(session: Session) -> dict[str, Signup]:
-    owner = User()
-    session.add(owner)
-    session.flush()
+def signups(session: Session, accounts) -> dict[str, Signup]:
+    alice, bob = accounts["alice"].id, accounts["bob"].id
     rows = {
-        "shop": Signup(site_name="Example Shop", site_domain="shop.example.com",
+        "shop": Signup(user_id=alice, site_name="Example Shop", site_domain="shop.example.com",
                        alias="ab12@leaktrap.xyz", nickname="Ocelot", surname_variant="Dhingraa"),
-        "news": Signup(site_name="Daily News", site_domain="news.example.org",
+        "news": Signup(user_id=alice, site_name="Daily News", site_domain="news.example.org",
                        alias="cd34@leaktrap.xyz", nickname="Zephyr"),
-        "owned": Signup(user_id=owner.id, site_name="Private Bank", site_domain="bank.example.net",
+        "owned": Signup(user_id=bob, site_name="Private Bank", site_domain="bank.example.net",
                         alias="ef56@leaktrap.xyz", nickname="Kestrel"),
+        "historical": Signup(site_name="Old Forum", site_domain="forum.example.net",
+                             alias="gh78@leaktrap.xyz", nickname="Heron"),
     }
     session.add_all(rows.values())
     session.commit()
@@ -100,23 +109,33 @@ def test_missing_optional_fields_are_fine(client, signups) -> None:
     assert result["matches"][0]["signup_id"] == signups["news"].id
 
 
-def test_other_owners_signups_are_never_disclosed(client, signups) -> None:
-    owned = signups["owned"]
-    # Without user_id only unowned signups are searched.
-    for clue in ({"recipient": "ef56@leaktrap.xyz"}, {"nickname": "Kestrel"},
-                 {"sender": "a@bank.example.net"}):
+def test_other_users_and_unowned_signups_are_never_disclosed(client, session, signups, accounts) -> None:
+    # Bob's and the unowned historical signup never match for Alice.
+    for clue in ({"recipient": "ef56@leaktrap.xyz"}, {"nickname": "Kestrel"}, {"sender": "a@bank.example.net"},
+                 {"recipient": "gh78@leaktrap.xyz"}, {"nickname": "Heron"}, {"sender": "a@forum.example.net"}):
         result = check(client, **clue)
         assert result["matches"] == [], clue
-        assert "Private Bank" not in str(result)
+        assert "Private Bank" not in str(result) and "Old Forum" not in str(result)
+    # Bob sees his own, not Alice's.
+    bob = TestClient(app)
+    sign_in(bob, session, accounts["bob"])
+    scoped = check(bob, recipient="ef56@leaktrap.xyz", nickname="Ocelot")
+    assert [m["signup_id"] for m in scoped["matches"]] == [signups["owned"].id]
 
-    # In the owner's scope it matches, and unowned signups are not included.
-    scoped = check(client, recipient="ef56@leaktrap.xyz", nickname="Ocelot", user_id=owned.user_id)
-    assert [m["signup_id"] for m in scoped["matches"]] == [owned.id]
 
-
-def test_unknown_user_id_rejected(client, signups) -> None:
-    response = client.post("/matcher/check", json={"recipient": "ab12@leaktrap.xyz", "user_id": 987654321})
+@pytest.mark.parametrize("user_id", [987654321, 1])
+def test_client_supplied_user_id_is_rejected(client, signups, user_id) -> None:
+    response = client.post("/matcher/check", json={"recipient": "ab12@leaktrap.xyz", "user_id": user_id})
     assert response.status_code == 422
+
+
+def test_signed_out_check_is_refused(session, signups) -> None:
+    app.dependency_overrides[get_db] = lambda: session
+    try:
+        anon = TestClient(app, headers={"Origin": ORIGIN})
+        assert anon.post("/matcher/check", json={"recipient": "ab12@leaktrap.xyz"}).status_code == 401
+    finally:
+        app.dependency_overrides.clear()
 
 
 def test_check_does_not_create_incident_by_default(client, session, signups) -> None:
@@ -134,6 +153,7 @@ def test_opt_in_records_suspected_incident(client, session, signups) -> None:
                    subject="Hi Ocelot", record_incident=True)
     incident = session.get(Incident, result["incident_id"])
     assert incident.id != existing.id
+    assert incident.user_id == signups["shop"].user_id  # owned by the signed-in user
     assert incident.channel == "email"
     assert incident.result == "matched"  # matcher status, not "confirmed"
     assert incident.confidence == "high"

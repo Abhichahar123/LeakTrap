@@ -29,9 +29,6 @@ class SignupCreate(BaseModel):
 
     site_name: str = Field(description="Website or organization name.", examples=["Example Shop"])
     site_domain: str | None = Field(default=None, examples=["shop.example.com"])
-    user_id: int | None = Field(
-        default=None, gt=0, le=MAX_BIGINT, description="Optional ID of an existing user."
-    )
     real_name_required: bool = False
     surname_variant: str | None = Field(
         default=None,

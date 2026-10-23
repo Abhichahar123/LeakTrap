@@ -9,6 +9,7 @@ from sqlalchemy.exc import OperationalError
 from backend.config import get_settings
 from backend.database import get_db
 from backend.main import app
+from tests.auth_support import FAKE_HEADERS, fake_auth
 from backend.routes.dashboard import DashboardConfig, get_dashboard_config
 
 LOCAL = ("127.0.0.1", 50000)
@@ -27,6 +28,7 @@ class BrokenSession:
 @pytest.fixture(autouse=True)
 def overrides():
     app.dependency_overrides[get_db] = lambda: None
+    fake_auth(app)
     app.dependency_overrides[get_dashboard_config] = lambda: DashboardConfig(enabled=True)
     yield
     app.dependency_overrides.clear()
@@ -34,7 +36,7 @@ def overrides():
 
 @pytest.fixture
 def local():
-    return TestClient(app, client=LOCAL)
+    return TestClient(app, client=LOCAL, headers=FAKE_HEADERS)
 
 
 def test_page_renders_with_notice_and_security_headers(local) -> None:
@@ -94,15 +96,14 @@ def test_dashboard_enabled_by_default_only_in_development(monkeypatch) -> None:
     "query",
     ["/dashboard/api/signups?limit=0", "/dashboard/api/signups?limit=101",
      "/dashboard/api/signups?offset=-1", "/dashboard/api/emails?limit=abc",
-     "/dashboard/api/emails?status=confirmed_leak", "/dashboard/api/overview?user_id=0",
-     "/dashboard/api/overview?user_id=-5", f"/dashboard/api/emails?user_id={2**63}",
+     "/dashboard/api/emails?status=confirmed_leak",
      "/dashboard/api/emails/0", "/dashboard/api/emails/abc"],
 )
 def test_invalid_parameters_are_422(local, query) -> None:
     assert local.get(query).status_code == 422
 
 
-@pytest.mark.parametrize("path", API_PATHS + ["/dashboard/api/overview?user_id=3"])
+@pytest.mark.parametrize("path", API_PATHS + ["/dashboard/api/overview?user_id=3"])  # user_id is ignored
 def test_database_failure_is_503_without_details(local, path) -> None:
     app.dependency_overrides[get_db] = lambda: BrokenSession()
     response = local.get(path)

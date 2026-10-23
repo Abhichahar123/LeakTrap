@@ -19,6 +19,7 @@ from backend.routes.signups import get_alias_config
 from backend.services import alias_generator, nickname_generator, signup_service
 from backend.services.alias_generator import AliasConfig
 from backend.services.nickname_generator import NicknameExhaustedError
+from tests.auth_support import ORIGIN, make_account, sign_in
 
 pytestmark = pytest.mark.integration
 
@@ -27,11 +28,28 @@ ALIAS_PATTERN = r"lt\.[a-z0-9]{4}@aliases\.test\.example"
 
 
 @pytest.fixture
-def client(session: Session):
+def alice(session: Session) -> User:
+    return make_account(session, "alice@example.com")
+
+
+@pytest.fixture
+def client(session: Session, alice: User):
+    """Signed in as Alice."""
     app.dependency_overrides[get_db] = lambda: session
     app.dependency_overrides[get_alias_config] = lambda: ALIAS_CONFIG
-    yield TestClient(app)
+    client = TestClient(app)
+    sign_in(client, session, alice)
+    yield client
     app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def bob_client(session: Session, client):
+    """A second, independent account (Bob), signed in on its own client."""
+    bob = make_account(session, "bob@example.com")
+    other = TestClient(app)
+    sign_in(other, session, bob)
+    return other
 
 
 def signup_count(session: Session) -> int:
@@ -120,18 +138,55 @@ def test_markers_can_be_disabled(client) -> None:
     assert body["alias"] is None and body["nickname"] is None
 
 
-def test_existing_user_is_accepted(client, session) -> None:
-    user = make_user(session)
-    body = client.post("/signups", json={"site_name": "Shop", "user_id": user.id}).json()
-    assert body["user_id"] == user.id
+def test_signups_belong_to_the_signed_in_user(client, session, alice) -> None:
+    body = client.post("/signups", json={"site_name": "Shop"}).json()
+    assert body["user_id"] == alice.id
+    assert session.get(Signup, body["id"]).user_id == alice.id
 
 
-def test_nonexistent_user_is_rejected_without_saving(client, session) -> None:
+@pytest.mark.parametrize("user_id", [987654321, 1, 2])
+def test_client_supplied_user_id_is_rejected_without_saving(client, session, user_id) -> None:
     before = signup_count(session)
-    response = client.post("/signups", json={"site_name": "Shop", "user_id": 987654321})
+    response = client.post("/signups", json={"site_name": "Shop", "user_id": user_id})
     assert response.status_code == 422
-    assert "user_id" in response.json()["detail"]
     assert signup_count(session) == before
+
+
+def test_signed_out_requests_are_refused(session) -> None:
+    app.dependency_overrides[get_db] = lambda: session
+    anonymous = TestClient(app, headers={"Origin": ORIGIN})
+    try:
+        for method, path, body in [("post", "/signups", {"site_name": "Shop"}), ("get", "/signups", None),
+                                   ("get", "/signups/1", None), ("delete", "/signups/1", None)]:
+            response = anonymous.request(method.upper(), path, json=body)
+            assert response.status_code == 401, (method, path)
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_other_users_signups_are_invisible_and_untouchable(client, bob_client, session) -> None:
+    alice_signup = client.post("/signups", json={"site_name": "Alice Shop", "site_domain": "shop.example.com"}).json()
+    session.add(Signup(site_name="Historical", site_domain="shop.example.com", alias="hist@leaktrap.xyz"))
+    session.commit()
+    unowned_id = session.scalar(select(Signup.id).where(Signup.site_name == "Historical"))
+
+    listing = bob_client.get("/signups").json()
+    assert listing["total"] == 0 and listing["items"] == []
+    assert bob_client.get("/signups", params={"site_domain": "shop.example.com"}).json()["total"] == 0
+    for signup_id in (alice_signup["id"], unowned_id, 987654321):
+        assert bob_client.get(f"/signups/{signup_id}").status_code == 404
+        assert bob_client.delete(f"/signups/{signup_id}").status_code == 404
+    # Alice cannot see the unowned historical record either.
+    assert client.get(f"/signups/{unowned_id}").status_code == 404
+    assert [i["id"] for i in client.get("/signups").json()["items"]] == [alice_signup["id"]]
+    # Nothing was deleted by Bob's attempts.
+    assert session.get(Signup, alice_signup["id"]) is not None and session.get(Signup, unowned_id) is not None
+
+
+def test_new_aliases_have_eight_characters_by_default(client) -> None:
+    app.dependency_overrides[get_alias_config] = lambda: AliasConfig(domain="aliases.test.example")
+    alias = client.post("/signups", json={"site_name": "Shop"}).json()["alias"]
+    assert re.fullmatch(r"[a-z0-9]{8}@aliases\.test\.example", alias)
 
 
 def test_missing_alias_domain_returns_503_without_saving(client, session) -> None:
@@ -198,10 +253,9 @@ def test_retry_exhaustion_returns_503_without_saving(client, session, monkeypatc
     assert signup_count(session) == before
 
 
-def test_nickname_exhaustion_returns_409_without_saving(client, session, monkeypatch) -> None:
+def test_nickname_exhaustion_returns_409_without_saving(client, bob_client, session, monkeypatch) -> None:
     monkeypatch.setattr(nickname_generator, "NICKNAMES", ("Falcon", "Zephyr"))
-    user = make_user(session)
-    payload = {"site_name": "Shop", "user_id": user.id}
+    payload = {"site_name": "Shop"}
     first = client.post("/signups", json=payload).json()["nickname"]
     second = client.post("/signups", json=payload).json()["nickname"]
     assert {first, second} == {"Falcon", "Zephyr"}
@@ -212,15 +266,15 @@ def test_nickname_exhaustion_returns_409_without_saving(client, session, monkeyp
     assert "generate_nickname=false" in response.json()["detail"]
     assert signup_count(session) == before
 
-    # Another owner's scope is independent.
-    other = make_user(session)
-    assert client.post("/signups", json={"site_name": "Shop", "user_id": other.id}).status_code == 201
+    # Another account's nicknames are independent.
+    assert bob_client.post("/signups", json={"site_name": "Shop"}).status_code == 201
 
 
-def test_anonymous_signups_share_one_nickname_scope(client, monkeypatch) -> None:
+def test_each_account_has_its_own_nickname_scope(client, bob_client, monkeypatch) -> None:
     monkeypatch.setattr(nickname_generator, "NICKNAMES", ("Falcon",))
     assert client.post("/signups", json={"site_name": "A"}).json()["nickname"] == "Falcon"
     assert client.post("/signups", json={"site_name": "B"}).status_code == 409
+    assert bob_client.post("/signups", json={"site_name": "A"}).json()["nickname"] == "Falcon"
 
 
 def test_concurrent_signups_get_distinct_markers(engine: Engine, monkeypatch, caplog) -> None:

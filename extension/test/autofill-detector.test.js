@@ -7,11 +7,11 @@ import vm from "node:vm";
 const source = readFileSync(new URL("../content/autofill.js", import.meta.url), "utf8");
 const sandbox = {};
 vm.runInNewContext(source, sandbox);
-const { classify, formKind, clean } = sandbox.__leaktraceAutofill;
+const { classify, classifyWithReason, formKind, clean } = sandbox.__leaktraceAutofill;
 const input = (attrs) => ({ tag: "INPUT", type: "text", ...attrs });
 
 test("loading without chrome APIs only exposes pure helpers (no listeners, no DOM access)", () => {
-  assert.deepEqual(Object.keys(sandbox.__leaktraceAutofill).sort(), ["classify", "clean", "formKind"]);
+  assert.deepEqual(Object.keys(sandbox.__leaktraceAutofill).sort(), ["classify", "classifyWithReason", "clean", "formKind"]);
 });
 
 for (const [name, attrs, expected] of [
@@ -37,7 +37,9 @@ for (const [name, attrs, expected] of [
 for (const [name, attrs] of [
   ["password type", { type: "password", name: "email" }],
   ["hidden type", { type: "hidden", name: "email" }],
-  ["number/tel/search/checkbox types", { type: "tel", name: "email" }],
+  ["phone-only tel input", { type: "tel", name: "phone" }],
+  ["number input", { type: "number", name: "email" }],
+  ["checkbox", { type: "checkbox", name: "email" }],
   ["search type", { type: "search", name: "username" }],
   ["textarea", { tag: "TEXTAREA", name: "email" }],
   ["select", { tag: "SELECT", name: "email" }],
@@ -85,4 +87,37 @@ test("labels are flattened to short plain text", () => {
   assert.ok(label.length <= 60);
   assert.ok(!/[\u0000-\u001f]/.test(label));
   assert.ok(label.startsWith("<img src=x onerror=alert(1)> Email address"));  // stays text; rendered with textContent
+});
+
+// ---------- regression: combined "email or phone" fields (e.g. Facebook's login) ----------
+
+for (const [name, attrs, expected] of [
+  ["Facebook login input", { type: "text", name: "email", id: "email", placeholder: "Email address or phone number",
+    ariaLabel: "Email address or phone number" }, "email"],
+  ["label 'Email or mobile number' with no helpful id", { type: "text", id: "_r_5_", label: "Email or mobile number" }, "email"],
+  ["accessible name only", { type: "text", ariaLabel: "Mobile number or email" }, "email"],
+  ["'Phone, email or username'", { type: "text", name: "text", label: "Phone, email or username" }, "email"],
+  ["tel input that also takes email", { type: "tel", label: "Email or phone" }, "email"],
+  ["autocomplete 'email tel'", { autocomplete: "email tel" }, "email"],
+  ["standard type=email", { type: "email", name: "x" }, "email"],
+]) {
+  test(`combined field: ${name} is ${expected}`, () => assert.equal(classify(input(attrs)), expected));
+}
+
+for (const [name, attrs, reason] of [
+  ["phone-only label", { label: "Mobile number" }, "phone"],
+  ["phone-only tel", { type: "tel", label: "Phone" }, "type"],
+  ["autocomplete tel only", { autocomplete: "tel", label: "Contact" }, "phone"],
+  ["one-time code even if it mentions email", { autocomplete: "one-time-code", label: "Code sent to your email" }, "sensitive"],
+  ["email verification code", { label: "Email verification code" }, "sensitive"],
+  ["password-reset answer mentioning email", { label: "Security answer (email)" }, "sensitive"],
+  ["card number", { autocomplete: "cc-number email" }, "sensitive"],
+  ["unrelated text", { label: "Company" }, "unrecognized"],
+]) {
+  test(`excluded with reason "${reason}": ${name}`, () => assert.deepEqual(
+    JSON.parse(JSON.stringify(classifyWithReason(input(attrs)))), { kind: null, reason }));
+}
+
+test("a combined email-or-phone field always receives the email alias (kind email, never a phone value)", () => {
+  assert.equal(classifyWithReason(input({ label: "Email or mobile number" })).kind, "email");
 });

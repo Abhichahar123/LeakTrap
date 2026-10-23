@@ -6,13 +6,15 @@ from fastapi.testclient import TestClient
 
 from backend.database import get_db
 from backend.main import app
+from tests.auth_support import FAKE_HEADERS, fake_auth
 from backend.schemas.signup import SignupCreate
 
 
 @pytest.fixture
 def client():
     app.dependency_overrides[get_db] = lambda: None
-    yield TestClient(app)
+    fake_auth(app)
+    yield TestClient(app, headers=FAKE_HEADERS)
     app.dependency_overrides.clear()
 
 
@@ -65,8 +67,9 @@ def test_server_generated_and_unknown_fields_rejected(client, field) -> None:
     assert post(client, {"site_name": "Shop", **field}).status_code == 422
 
 
-@pytest.mark.parametrize("user_id", [0, -1, 2**63, "abc"])
-def test_invalid_user_id_rejected(client, user_id) -> None:
+@pytest.mark.parametrize("user_id", [0, -1, 2**63, "abc", 1, 2])
+def test_client_supplied_user_id_is_rejected(client, user_id) -> None:
+    # Ownership comes from the session; a user_id in the body is never accepted.
     assert post(client, {"site_name": "Shop", "user_id": user_id}).status_code == 422
 
 

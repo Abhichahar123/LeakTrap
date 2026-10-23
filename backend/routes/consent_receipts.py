@@ -1,7 +1,8 @@
-"""Consent receipt endpoints.
+"""Consent receipt endpoints for the signed-in user's own signups.
 
-Local development only: like the dashboard, these routes answer only requests
-from this machine. The user_id scope is a filter, not authentication.
+Recording a receipt is allowed from the dashboard (web session) or a connected
+extension (receipts:create scope); reading needs the dashboard. As an extra
+layer, like the dashboard, these routes answer only requests from this machine.
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request
@@ -11,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from backend.database import get_db
 from backend.routes.common import read_limited_body, require_json, validation_error
-from backend.routes.dashboard import MAX_PAGE_SIZE, require_local_dashboard, resolve_scope
+from backend.routes.dashboard import MAX_PAGE_SIZE, require_local_dashboard
 from backend.schemas.consent_receipt import (
     ConsentReceiptCreate,
     ConsentReceiptDetail,
@@ -19,6 +20,8 @@ from backend.schemas.consent_receipt import (
 )
 from backend.schemas.signup import MAX_BIGINT
 from backend.services import consent_receipts
+from backend.security import require_scope, require_user
+from backend.services.auth import AuthContext
 from backend.services.consent_receipts import NotInScopeError
 
 MAX_BODY_BYTES = 128 * 1024
@@ -34,7 +37,7 @@ router = APIRouter(
     status_code=201,
     response_model=ConsentReceiptDetail,
     responses={
-        404: {"description": "Signup not found in this scope"},
+        404: {"description": "Signup not found"},
         413: {"description": "Body too large"},
         415: {"description": "Body is not JSON"},
         422: {"description": "Invalid input"},
@@ -44,7 +47,7 @@ router = APIRouter(
 )
 async def create_receipt(
     request: Request,
-    user_id: int | None = Depends(resolve_scope),
+    auth: AuthContext = Depends(require_scope("receipts:create")),
     db: Session = Depends(get_db),
 ) -> ConsentReceiptDetail:
     """Record a receipt you are reporting for one of your signups.
@@ -59,9 +62,9 @@ async def create_receipt(
     except ValidationError as exc:
         raise validation_error(exc) from None
     try:
-        return await run_in_threadpool(consent_receipts.create, db, user_id, payload)
+        return await run_in_threadpool(consent_receipts.create, db, auth.user_id, payload)
     except NotInScopeError:
-        raise HTTPException(404, "Signup not found in this scope") from None
+        raise HTTPException(404, "Signup not found") from None
 
 
 @router.get("", response_model=ConsentReceiptPage, responses={404: {}})
@@ -69,23 +72,23 @@ def list_receipts(
     signup_id: int | None = Query(None, gt=0, le=MAX_BIGINT),
     limit: int = Query(20, ge=1, le=MAX_PAGE_SIZE),
     offset: int = Query(0, ge=0, le=MAX_BIGINT),
-    user_id: int | None = Depends(resolve_scope),
+    auth: AuthContext = Depends(require_user),
     db: Session = Depends(get_db),
 ) -> ConsentReceiptPage:
     try:
-        items, total = consent_receipts.list_receipts(db, user_id, limit, offset, signup_id)
+        items, total = consent_receipts.list_receipts(db, auth.user_id, limit, offset, signup_id)
     except NotInScopeError:
-        raise HTTPException(404, "Signup not found in this scope") from None
+        raise HTTPException(404, "Signup not found") from None
     return ConsentReceiptPage(items=items, total=total, limit=limit, offset=offset)
 
 
 @router.get("/{receipt_id}", response_model=ConsentReceiptDetail, responses={404: {}})
 def get_receipt(
     receipt_id: int = Path(gt=0, le=MAX_BIGINT),
-    user_id: int | None = Depends(resolve_scope),
+    auth: AuthContext = Depends(require_user),
     db: Session = Depends(get_db),
 ) -> ConsentReceiptDetail:
     try:
-        return consent_receipts.get(db, user_id, receipt_id)
+        return consent_receipts.get(db, auth.user_id, receipt_id)
     except NotInScopeError:
-        raise HTTPException(404, "Receipt not found in this scope") from None
+        raise HTTPException(404, "Receipt not found") from None

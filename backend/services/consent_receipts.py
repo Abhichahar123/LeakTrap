@@ -1,7 +1,7 @@
-"""Create and read consent receipts within one ownership scope.
+"""Create and read consent receipts for the authenticated user.
 
-A receipt's owner is always taken from its signup, never from the client.
-The scope (a user_id, or "no user") is a filter, not authentication.
+A receipt's owner is always taken from its signup, which must belong to the
+authenticated user; other users' and unowned signups look nonexistent.
 """
 
 from collections.abc import Sequence
@@ -22,14 +22,16 @@ class NotInScopeError(Exception):
     """The signup or receipt does not exist in the requested scope."""
 
 
-def _owner(column, user_id: int | None):
-    return column.is_(None) if user_id is None else column == user_id
+from backend.services.ownership import owned_by
+
+_owner = owned_by
 
 
-def _signup_in_scope(session: Session, signup_id: int, user_id: int | None) -> Signup:
+def _signup_in_scope(session: Session, signup_id: int, user_id: int) -> Signup:
     signup = session.get(Signup, signup_id)
     # Same error whether it is missing or someone else's: do not reveal which.
-    if signup is None or signup.user_id != user_id:
+    owned_by(Signup.user_id, user_id)  # validates user_id
+    if signup is None or signup.user_id is None or signup.user_id != user_id:
         raise NotInScopeError
     return signup
 
@@ -56,7 +58,7 @@ def _detail(receipt: ConsentReceipt, site_name: str | None, site_domain: str | N
     )
 
 
-def create(session: Session, user_id: int | None, data: ConsentReceiptCreate) -> ConsentReceiptDetail:
+def create(session: Session, user_id: int, data: ConsentReceiptCreate) -> ConsentReceiptDetail:
     signup = _signup_in_scope(session, data.signup_id, user_id)
     receipt = ConsentReceipt(
         user_id=signup.user_id,
@@ -79,7 +81,7 @@ def create(session: Session, user_id: int | None, data: ConsentReceiptCreate) ->
     return _detail(receipt, signup.site_name, signup.site_domain)
 
 
-def _query(user_id: int | None):
+def _query(user_id: int):
     return (
         select(ConsentReceipt, Signup.site_name, Signup.site_domain)
         .outerjoin(Signup, ConsentReceipt.signup_id == Signup.id)
@@ -88,7 +90,7 @@ def _query(user_id: int | None):
 
 
 def list_receipts(
-    session: Session, user_id: int | None, limit: int, offset: int, signup_id: int | None = None
+    session: Session, user_id: int, limit: int, offset: int, signup_id: int | None = None
 ) -> tuple[list[ConsentReceiptSummary], int]:
     query = _query(user_id)
     if signup_id is not None:
@@ -102,7 +104,7 @@ def list_receipts(
     return [ConsentReceiptSummary(**_summary_fields(*row)) for row in rows], total or 0
 
 
-def get(session: Session, user_id: int | None, receipt_id: int) -> ConsentReceiptDetail:
+def get(session: Session, user_id: int, receipt_id: int) -> ConsentReceiptDetail:
     row = session.execute(_query(user_id).where(ConsentReceipt.id == receipt_id)).first()
     if row is None:
         raise NotInScopeError

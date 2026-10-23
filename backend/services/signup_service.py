@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from backend.models import Signup, User
 from backend.services.alias_generator import AliasConfig, alias_exists, generate_alias
+from backend.services.ownership import owned_by
 from backend.services.nickname_generator import (
     choose_nickname,
     used_nicknames,
@@ -103,9 +104,9 @@ def create_signup(session: Session, data: NewSignup, alias_config: AliasConfig) 
 
 
 def list_signups(
-    session: Session, limit: int, offset: int, site_domain: str | None = None
+    session: Session, user_id: int, limit: int, offset: int, site_domain: str | None = None
 ) -> tuple[list[Signup], int]:
-    query = select(Signup)
+    query = select(Signup).where(owned_by(Signup.user_id, user_id))
     if site_domain is not None:
         query = query.where(Signup.site_domain == site_domain)
     total = session.scalar(select(func.count()).select_from(query.subquery()))
@@ -115,25 +116,30 @@ def list_signups(
     return list(items), total or 0
 
 
+def get_signup(session: Session, user_id: int, signup_id: int) -> Signup | None:
+    """The user's own signup, or None (also for other users' and unowned signups)."""
+    return session.scalar(select(Signup).where(Signup.id == signup_id, owned_by(Signup.user_id, user_id)))
+
+
 def find_by_exact_domain(
-    session: Session, user_id: int | None, site_domain: str, limit: int = 10
+    session: Session, user_id: int, site_domain: str, limit: int = 10
 ) -> list[Signup]:
-    """Signups in one ownership scope whose site_domain equals site_domain exactly
+    """The user's signups whose site_domain equals site_domain exactly
     (no subdomain or parent-domain matching), newest first."""
-    owner = Signup.user_id.is_(None) if user_id is None else Signup.user_id == user_id
     query = (
         select(Signup)
-        .where(owner, Signup.site_domain == site_domain)
+        .where(owned_by(Signup.user_id, user_id), Signup.site_domain == site_domain)
         .order_by(Signup.created_at.desc(), Signup.id.desc())
         .limit(limit)
     )
     return list(session.scalars(query).all())
 
 
-def delete_signup(session: Session, signup_id: int) -> bool:
-    """Delete a signup. Linked consent receipts and mail logs are kept; the
-    database sets their signup_id to NULL. Returns False if it does not exist."""
-    signup = session.get(Signup, signup_id)
+def delete_signup(session: Session, signup_id: int, user_id: int) -> bool:
+    """Delete the user's own signup. Linked consent receipts and mail logs are
+    kept; the database sets their signup_id to NULL. Returns False if it does
+    not exist or belongs to someone else."""
+    signup = get_signup(session, user_id, signup_id)
     if signup is None:
         return False
     try:

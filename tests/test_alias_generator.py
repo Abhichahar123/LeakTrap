@@ -29,7 +29,7 @@ def test_alias_uses_configured_domain_and_prefix() -> None:
 
 def test_alias_without_prefix() -> None:
     alias = generate_alias(AliasConfig(domain="example.org"), never_taken)
-    assert re.fullmatch(r"[a-z0-9]{4}@example\.org", alias)
+    assert re.fullmatch(r"[a-z0-9]{8}@example\.org", alias)  # default length is 8
 
 
 def test_suffix_length_is_configurable() -> None:
@@ -106,7 +106,7 @@ def test_settings_have_no_hardcoded_domain(monkeypatch) -> None:
     monkeypatch.delenv("LEAKTRACE_ALIAS_DOMAIN", raising=False)
     config = AliasConfig.from_settings(get_settings())
     assert config.domain is None
-    assert config.suffix_length == 4
+    assert config.suffix_length == 8  # new aliases: 8 characters (existing aliases are unchanged)
 
 
 def test_generator_makes_no_verification_claim() -> None:

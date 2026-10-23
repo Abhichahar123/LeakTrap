@@ -1,103 +1,151 @@
-"""Read-only queries for the local dashboard.
+"""Read-only queries for the personal dashboard.
 
-Every query is limited to one ownership scope: the signups and mail of a given
-user_id, or, when none is given, records that have no user. Without
-authentication this scope is a filter, not access control.
+Every query is limited to the authenticated user's own records (owned_by);
+records without an owner are never returned. List queries use grouped
+subqueries for counts, so the number of queries does not grow with rows.
 """
 
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from backend.models import MailLog, Signup
+from backend.models import ConsentReceipt, Incident, MailLog, Signup
+from backend.services.ownership import owned_by
 
 MATCH_STATUSES = ("matched", "ambiguous", "no_match")
+SIGNUP_FILTERS = ("all", "with_receipts", "with_emails", "real_name")
 
 
-def _owner(column, user_id: int | None):
-    return column.is_(None) if user_id is None else column == user_id
-
-
-def mask_alias(alias: str | None) -> str | None:
-    """Hide the local part entirely; only the domain is shown."""
-    if not alias or "@" not in alias:
-        return None
-    return "•••@" + alias.split("@", 1)[1]
-
+# ---------- overview ----------
 
 @dataclass(frozen=True)
 class Overview:
-    signups_total: int
+    websites: int
+    aliases: int
+    nicknames: int
+    receipts: int
     emails_total: int
     matched: int
     ambiguous: int
     no_match: int
     unprocessed: int
+    investigations: int
 
 
-def overview(session: Session, user_id: int | None) -> Overview:
-    signups_total = session.scalar(
-        select(func.count()).select_from(Signup).where(_owner(Signup.user_id, user_id))
-    )
+def overview(session: Session, user_id: int) -> Overview:
+    s = session.execute(
+        select(func.count(), func.count(Signup.alias), func.count(Signup.nickname))
+        .where(owned_by(Signup.user_id, user_id))
+    ).one()
+    receipts = session.scalar(select(func.count()).select_from(ConsentReceipt).where(owned_by(ConsentReceipt.user_id, user_id)))
+    investigations = session.scalar(select(func.count()).select_from(Incident).where(owned_by(Incident.user_id, user_id)))
     rows = session.execute(
-        select(MailLog.match_status, func.count())
-        .where(_owner(MailLog.user_id, user_id))
-        .group_by(MailLog.match_status)
+        select(MailLog.match_status, func.count()).where(owned_by(MailLog.user_id, user_id)).group_by(MailLog.match_status)
     ).all()
     counts = {status: count for status, count in rows}
-    known = {s: counts.get(s, 0) for s in MATCH_STATUSES}
-    # Rows from before ingestion stored a status (or with any other value).
-    unprocessed = sum(c for s, c in counts.items() if s not in MATCH_STATUSES)
-    return Overview(signups_total or 0, sum(counts.values()), **known, unprocessed=unprocessed)
+    known = {status: counts.get(status, 0) for status in MATCH_STATUSES}
+    unprocessed = sum(c for status, c in counts.items() if status not in MATCH_STATUSES)
+    return Overview(
+        websites=s[0], aliases=s[1], nicknames=s[2], receipts=receipts or 0, emails_total=sum(counts.values()),
+        **known, unprocessed=unprocessed, investigations=investigations or 0,
+    )
 
+
+# ---------- My Websites ----------
 
 @dataclass(frozen=True)
 class SignupRow:
     id: int
     site_name: str
     site_domain: str | None
-    alias_masked: str | None
-    has_nickname: bool
-    has_surname_variant: bool
+    alias: str | None
+    nickname: str | None
     real_name_required: bool
+    receipt_count: int
     email_count: int
     created_at: datetime
 
 
-def list_signups(
-    session: Session, user_id: int | None, limit: int, offset: int
-) -> tuple[list[SignupRow], int]:
-    scope = _owner(Signup.user_id, user_id)
-    total = session.scalar(select(func.count()).select_from(Signup).where(scope))
-    # One grouped subquery instead of a count query per signup.
-    email_counts = (
-        select(MailLog.signup_id, func.count().label("n"))
-        .where(MailLog.signup_id.is_not(None))
-        .group_by(MailLog.signup_id)
-        .subquery()
+def _escape_like(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _counts_subqueries(user_id: int):
+    receipts = (
+        select(ConsentReceipt.signup_id, func.count().label("n"))
+        .where(owned_by(ConsentReceipt.user_id, user_id), ConsentReceipt.signup_id.is_not(None))
+        .group_by(ConsentReceipt.signup_id).subquery()
     )
+    emails = (
+        select(MailLog.signup_id, func.count().label("n"))
+        .where(owned_by(MailLog.user_id, user_id), MailLog.signup_id.is_not(None))
+        .group_by(MailLog.signup_id).subquery()
+    )
+    return receipts, emails
+
+
+def list_signups(
+    session: Session, user_id: int, limit: int, offset: int, q: str | None = None, filter_: str = "all"
+) -> tuple[list[SignupRow], int]:
+    receipts, emails = _counts_subqueries(user_id)
+    receipt_n = func.coalesce(receipts.c.n, 0)
+    email_n = func.coalesce(emails.c.n, 0)
+    query = (
+        select(Signup, receipt_n, email_n)
+        .outerjoin(receipts, receipts.c.signup_id == Signup.id)
+        .outerjoin(emails, emails.c.signup_id == Signup.id)
+        .where(owned_by(Signup.user_id, user_id))
+    )
+    if q:
+        pattern = f"%{_escape_like(q.strip().lower())}%"
+        query = query.where(or_(*(func.lower(col).like(pattern, escape="\\") for col in
+                                  (Signup.site_name, Signup.site_domain, Signup.alias, Signup.nickname))))
+    if filter_ == "with_receipts":
+        query = query.where(receipt_n > 0)
+    elif filter_ == "with_emails":
+        query = query.where(email_n > 0)
+    elif filter_ == "real_name":
+        query = query.where(Signup.real_name_required.is_(True))
+    total = session.scalar(select(func.count()).select_from(query.subquery()))
     rows = session.execute(
-        select(Signup, func.coalesce(email_counts.c.n, 0))
-        .outerjoin(email_counts, email_counts.c.signup_id == Signup.id)
-        .where(scope)
-        .order_by(Signup.created_at.desc(), Signup.id.desc())
-        .limit(limit)
-        .offset(offset)
+        query.order_by(Signup.created_at.desc(), Signup.id.desc()).limit(limit).offset(offset)
     ).all()
     items = [
-        SignupRow(
-            id=s.id, site_name=s.site_name, site_domain=s.site_domain,
-            alias_masked=mask_alias(s.alias), has_nickname=s.nickname is not None,
-            has_surname_variant=s.surname_variant is not None,
-            real_name_required=s.real_name_required, email_count=n, created_at=s.created_at,
-        )
-        for s, n in rows
+        SignupRow(id=s.id, site_name=s.site_name, site_domain=s.site_domain, alias=s.alias, nickname=s.nickname,
+                  real_name_required=s.real_name_required, receipt_count=r, email_count=e, created_at=s.created_at)
+        for s, r, e in rows
     ]
     return items, total or 0
 
+
+@dataclass(frozen=True)
+class SignupDetail:
+    signup: Signup
+    receipts: list[ConsentReceipt]
+    emails: list["EmailRow"]
+
+
+def get_signup_detail(session: Session, user_id: int, signup_id: int, recent: int = 20) -> SignupDetail | None:
+    signup = session.scalar(select(Signup).where(Signup.id == signup_id, owned_by(Signup.user_id, user_id)))
+    if signup is None:
+        return None
+    receipts = session.scalars(
+        select(ConsentReceipt)
+        .where(owned_by(ConsentReceipt.user_id, user_id), ConsentReceipt.signup_id == signup.id)
+        .order_by(ConsentReceipt.created_at.desc(), ConsentReceipt.id.desc()).limit(recent)
+    ).all()
+    emails = session.execute(
+        _email_query(user_id).where(MailLog.signup_id == signup.id)
+        .order_by(MailLog.received_at.desc(), MailLog.id.desc()).limit(recent)
+    ).all()
+    return SignupDetail(signup, list(receipts), [_email_row(*row) for row in emails])
+
+
+# ---------- email activity ----------
 
 @dataclass(frozen=True)
 class EmailRow:
@@ -113,11 +161,11 @@ class EmailRow:
     sender_domain: str | None
 
 
-def _email_query(user_id: int | None):
+def _email_query(user_id: int):
     return (
         select(MailLog, Signup.site_name, Signup.site_domain)
         .outerjoin(Signup, MailLog.signup_id == Signup.id)
-        .where(_owner(MailLog.user_id, user_id))
+        .where(owned_by(MailLog.user_id, user_id))
     )
 
 
@@ -131,7 +179,7 @@ def _email_row(log: MailLog, site_name: str | None, site_domain: str | None) -> 
 
 
 def list_emails(
-    session: Session, user_id: int | None, limit: int, offset: int, status: str | None = None
+    session: Session, user_id: int, limit: int, offset: int, status: str | None = None
 ) -> tuple[list[EmailRow], int]:
     query = _email_query(user_id)
     if status == "unprocessed":
@@ -145,6 +193,46 @@ def list_emails(
     return [_email_row(*row) for row in rows], total or 0
 
 
-def get_email(session: Session, user_id: int | None, mail_log_id: int) -> EmailRow | None:
+def get_email(session: Session, user_id: int, mail_log_id: int) -> EmailRow | None:
     row = session.execute(_email_query(user_id).where(MailLog.id == mail_log_id)).first()
     return _email_row(*row) if row else None
+
+
+# ---------- leak investigations (matcher incidents the user chose to record) ----------
+
+@dataclass(frozen=True)
+class InvestigationRow:
+    id: int
+    created_at: datetime
+    channel: str
+    result: str | None
+    confidence: str | None
+    matched_site: str | None
+    recipient_alias_matched: bool
+    sender_domain: str | None
+    candidate_count: int
+    signal_types: list[str]
+
+
+def _summary(evidence: dict[str, Any] | None) -> tuple[bool, str | None, int, list[str]]:
+    evidence = evidence if isinstance(evidence, dict) else {}
+    candidates = evidence.get("candidates") if isinstance(evidence.get("candidates"), list) else []
+    signals = sorted({s for c in candidates if isinstance(c, dict) for s in (c.get("signals") or []) if isinstance(s, str)})
+    sender = evidence.get("sender_domain")
+    return (evidence.get("recipient_alias_matched") is True, sender if isinstance(sender, str) else None,
+            len(candidates), signals)
+
+
+def list_investigations(session: Session, user_id: int, limit: int, offset: int) -> tuple[list[InvestigationRow], int]:
+    query = select(Incident).where(owned_by(Incident.user_id, user_id))
+    total = session.scalar(select(func.count()).select_from(query.subquery()))
+    rows = session.scalars(query.order_by(Incident.created_at.desc(), Incident.id.desc()).limit(limit).offset(offset)).all()
+    items = []
+    for i in rows:
+        alias_matched, sender, n, signals = _summary(i.evidence)
+        items.append(InvestigationRow(
+            id=i.id, created_at=i.created_at, channel=i.channel, result=i.result, confidence=i.confidence,
+            matched_site=i.matched_site, recipient_alias_matched=alias_matched, sender_domain=sender,
+            candidate_count=n, signal_types=signals,
+        ))
+    return items, total or 0

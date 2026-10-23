@@ -178,7 +178,11 @@ export class ApiError extends Error {
   }
 }
 
+export const RECONNECT_MESSAGE =
+  "LeakTrace isn't connected to your account (or the connection expired or was revoked). Connect it again in Settings.";
+
 function errorMessage(status, body) {
+  if (status === 401) return RECONNECT_MESSAGE;
   const detail = body?.detail;
   if (typeof detail === "string") return detail;
   if (Array.isArray(detail) && detail.length) {
@@ -192,14 +196,22 @@ function errorMessage(status, body) {
   return `The backend returned HTTP ${status}.`;
 }
 
-export function createApi(baseUrl, fetchImpl = globalThis.fetch) {
+/**
+ * API client. `token` is the extension's scoped account token (from a
+ * dashboard-approved pairing); it is sent as a Bearer header, never as a cookie.
+ */
+export function createApi(baseUrl, fetchImpl = globalThis.fetch, token = null) {
   const origin = validateBaseUrl(baseUrl);
-  async function call(path, init) {
+  async function call(path, init, { allowPending = false } = {}) {
     let response;
     try {
       response = await fetchImpl(`${origin}${path}`, {
         ...init,
-        headers: { accept: "application/json", ...(init?.body ? { "content-type": "application/json" } : {}) },
+        headers: {
+          accept: "application/json",
+          ...(init?.body ? { "content-type": "application/json" } : {}),
+          ...(token ? { authorization: `Bearer ${token}` } : {}),
+        },
         credentials: "omit",
         cache: "no-store",
       });
@@ -213,11 +225,40 @@ export function createApi(baseUrl, fetchImpl = globalThis.fetch) {
       // Non-JSON body: handled below.
     }
     if (!response.ok) throw new ApiError(errorMessage(response.status, body), response.status);
+    if (allowPending && response.status === 202) return { pending: true };
+    if (response.status === 204) return {};
     if (body === null || typeof body !== "object") throw new ApiError("The backend returned an unexpected response.");
     return body;
   }
   return {
     origin,
+    connected: Boolean(token),
+    /** Start connecting this extension; only the secret's hash is sent. */
+    async startPairing(secretHash) {
+      const body = await call("/extension/pairings", { method: "POST", body: JSON.stringify({ secret_hash: secretHash }) });
+      if (!Number.isSafeInteger(body.pairing_id) || !/^[A-Z2-9]{4}-[A-Z2-9]{4}$/.test(body.code ?? "")
+          || typeof body.approve_path !== "string" || !body.approve_path.startsWith("/dashboard#pair=")) {
+        throw new ApiError("The backend returned an unexpected pairing response.");
+      }
+      return { pairingId: body.pairing_id, code: body.code, expiresAt: Date.parse(body.expires_at), approvePath: body.approve_path };
+    },
+    /** { pending: true } until approved, then the stored-connection object. */
+    async exchangePairing(pairingId, secret) {
+      const body = await call(`/extension/pairings/${encodeURIComponent(pairingId)}/token`,
+        { method: "POST", body: JSON.stringify({ secret }) }, { allowPending: true });
+      if (body.pending) return body;
+      const auth = parseStoredAuth({ token: body.token, expiresAt: Date.parse(body.expires_at), email: body.email });
+      if (!auth) throw new ApiError("The backend returned an unexpected token response.");
+      return auth;
+    },
+    async whoami() {
+      const body = await call("/extension/whoami", { method: "GET" });
+      if (typeof body.email !== "string") throw new ApiError("The backend returned an unexpected response.");
+      return body;
+    },
+    async disconnect() {
+      await call("/extension/disconnect", { method: "POST" });
+    },
     async createSignup(payload) {
       const body = await call("/signups", { method: "POST", body: JSON.stringify(payload) });
       if (!Number.isSafeInteger(body.id) || typeof body.site_name !== "string") {
@@ -352,4 +393,61 @@ export function buildFillPlan(options, selectedIds, signup) {
   const fields = options.filter((o) => selected.has(o.id)).map((o) => ({ id: o.id, kind: o.kind, overwrite: !o.empty }));
   if (!fields.length) throw new Error("Tick at least one field to fill.");
   return { alias: signup.alias ?? null, nickname: signup.nickname ?? null, fields };
+}
+
+/**
+ * Whether a signup may be filled into the current tab. The tab hostname comes
+ * from the browser's tab URL (never from the page) and must equal the
+ * signup's site domain exactly: no parent, sibling or child subdomains.
+ */
+export function fillTargetCheck(signup, tabHost) {
+  if (!signup || (!signup.alias && !signup.nickname)) return { ok: false, reason: "This signup has no alias or nickname to fill." };
+  if (!tabHost) return { ok: false, reason: "This tab is not a website LeakTrace can fill." };
+  if (!signup.siteDomain) return { ok: false, reason: "This signup has no website domain, so LeakTrace will not fill it anywhere." };
+  if (signup.siteDomain !== tabHost) {
+    return { ok: false, reason: `This signup is for ${signup.siteDomain}, but this tab is ${tabHost}. LeakTrace only fills a signup on its own site.` };
+  }
+  return { ok: true, reason: "" };
+}
+
+/**
+ * One-line, value-free summary of what the detector skipped, e.g.
+ * "Checked 3 inputs: 1 password field (never filled), 2 not recognised as email or username fields."
+ */
+export function describeScanStats(stats) {
+  const n = (key) => (Number.isSafeInteger(stats?.[key]) && stats[key] > 0 ? stats[key] : 0);
+  const plural = (count, one, many) => `${count} ${count === 1 ? one : many}`;
+  const parts = [];
+  if (n("password")) parts.push(plural(n("password"), "password field (never filled)", "password fields (never filled)"));
+  if (n("hidden")) parts.push(plural(n("hidden"), "hidden or disabled input", "hidden or disabled inputs"));
+  if (n("phone")) parts.push(plural(n("phone"), "phone-only field", "phone-only fields"));
+  if (n("sensitive")) parts.push(plural(n("sensitive"), "code, payment or security field (never filled)", "code, payment or security fields (never filled)"));
+  if (n("type")) parts.push(plural(n("type"), "input of another type", "inputs of other types"));
+  if (n("unrecognized")) parts.push(plural(n("unrecognized"), "field not recognised as email or username", "fields not recognised as email or username"));
+  let text = n("inputs") ? `Checked ${plural(n("inputs"), "input", "inputs")}${parts.length ? `: ${parts.join(", ")}` : ""}.` : "No input fields were found.";
+  if (n("unreadableFrames")) {
+    text += ` ${plural(n("unreadableFrames"), "embedded frame comes", "embedded frames come")} from another site, which LeakTrace cannot read.`;
+  }
+  return text;
+}
+
+// ---------- account connection ----------
+
+/** A random pairing secret (kept only in memory until exchanged). */
+export function newPairingSecret(cryptoImpl = globalThis.crypto) {
+  const bytes = cryptoImpl.getRandomValues(new Uint8Array(32));
+  return btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/**
+ * The stored connection, or null if missing, malformed or expired. It lives
+ * only in chrome.storage.session (memory, cleared when the browser closes).
+ */
+export function parseStoredAuth(value, nowMs = Date.now()) {
+  if (!value || typeof value !== "object") return null;
+  const { token, expiresAt, email } = value;
+  if (typeof token !== "string" || token.length < 20 || token.length > 200 || /\s/.test(token)) return null;
+  if (!Number.isFinite(expiresAt) || expiresAt <= nowMs) return null;
+  if (typeof email !== "string" || !email.includes("@")) return null;
+  return { token, expiresAt, email };
 }

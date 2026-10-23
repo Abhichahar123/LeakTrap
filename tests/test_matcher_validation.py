@@ -6,6 +6,7 @@ from sqlalchemy.exc import OperationalError
 
 from backend.database import get_db
 from backend.main import app
+from tests.auth_support import FAKE_HEADERS, fake_auth
 
 
 class BrokenSession:
@@ -20,7 +21,8 @@ class BrokenSession:
 @pytest.fixture
 def client():
     app.dependency_overrides[get_db] = lambda: None
-    yield TestClient(app)
+    fake_auth(app)
+    yield TestClient(app, headers=FAKE_HEADERS)
     app.dependency_overrides.clear()
 
 
@@ -52,7 +54,7 @@ def test_request_without_any_clue_rejected(client) -> None:
      {"recipient": "a@leaktrap.xyz", "subject": "x" * 999},
      {"nickname": "   "},
      {"surname_variant": "x" * 101},
-     {"recipient": "a@leaktrap.xyz", "user_id": 0},
+     {"recipient": "a@leaktrap.xyz", "user_id": 0}, {"recipient": "a@leaktrap.xyz", "user_id": 2},
      {"recipient": "a@leaktrap.xyz", "record_incident": "maybe"}],
 )
 def test_invalid_fields_rejected(client, body) -> None:
@@ -60,12 +62,13 @@ def test_invalid_fields_rejected(client, body) -> None:
 
 
 @pytest.mark.parametrize(
-    "body", [{"recipient": "a@leaktrap.xyz", "user_id": 1}, {"recipient": "a@leaktrap.xyz"}]
+    "body", [{"recipient": "a@leaktrap.xyz"}, {"sender": "x@shop.example.com"}]
 )
 def test_database_error_returns_503_without_details(body) -> None:
     app.dependency_overrides[get_db] = lambda: BrokenSession()
+    fake_auth(app)
     try:
-        response = TestClient(app).post("/matcher/check", json=body)
+        response = TestClient(app, headers=FAKE_HEADERS).post("/matcher/check", json=body)
     finally:
         app.dependency_overrides.clear()
     assert response.status_code == 503

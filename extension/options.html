@@ -21,6 +21,15 @@
       </div>
     </form>
     <p id="status" class="status" role="status" aria-live="polite"></p>
+    <h2>LeakTrace account</h2>
+    <p id="account-status" class="status" role="status" aria-live="polite">Not connected.</p>
+    <div class="row">
+      <button type="button" id="connect">Connect to my LeakTrace account</button>
+      <button type="button" id="disconnect" class="secondary" hidden>Disconnect</button>
+    </div>
+    <p id="pairing" class="hint" hidden></p>
+    <p class="hint">Connecting opens your LeakTrace dashboard, where you approve this extension while signed in. The extension never sees your password. Its access is limited to creating and looking up your aliases and recording consent receipts, expires after a few hours, and is kept in memory only (connect again after restarting the browser). You can revoke it from the dashboard.</p>
+
     <h2>Autofill</h2>
     <label class="inline"><input type="checkbox" id="autofill-enabled"> Offer to fill sign-up and login forms with my saved LeakTrace alias</label>
     <p class="hint">Only runs on the tab where you open the LeakTrace popup. Every fill needs your click; forms are never submitted.</p>
@@ -33,6 +42,7 @@
     <ul>
       <li>These settings (the backend URL, whether autofill is on, and the hostnames where you chose “Never”), in local extension storage.</li>
       <li>The signup you last created or selected (ID, site, alias, nickname), in session storage, which is kept in memory and cleared when the browser closes. Use “Forget” in the popup to clear it sooner.</li>
+      <li>Your account connection (a short-lived, revocable token and your email address), in session storage only. Use “Disconnect” to remove it.</li>
       <li>Nothing else: no browsing history, page content, form values, passwords, cookies or receipt text. Aliases are looked up from the backend when you ask, not saved per site.</li>
     </ul>
   </main>

@@ -6,6 +6,7 @@ from sqlalchemy.exc import OperationalError
 
 from backend.database import get_db
 from backend.main import app
+from tests.auth_support import FAKE_HEADERS, fake_auth
 from backend.routes.dashboard import DashboardConfig, get_dashboard_config
 
 LOCAL = ("127.0.0.1", 50000)
@@ -21,6 +22,7 @@ class BrokenSession:
 @pytest.fixture(autouse=True)
 def overrides():
     app.dependency_overrides[get_db] = lambda: None
+    fake_auth(app)
     app.dependency_overrides[get_dashboard_config] = lambda: DashboardConfig(enabled=True)
     yield
     app.dependency_overrides.clear()
@@ -28,7 +30,7 @@ def overrides():
 
 @pytest.fixture
 def local():
-    return TestClient(app, client=LOCAL)
+    return TestClient(app, client=LOCAL, headers=FAKE_HEADERS)
 
 
 @pytest.mark.parametrize(

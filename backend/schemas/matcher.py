@@ -2,7 +2,6 @@
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from backend.schemas.signup import MAX_BIGINT
 from backend.services.domains import normalize_email
 
 
@@ -36,10 +35,6 @@ class MatchCheckRequest(BaseModel):
     subject: str | None = Field(default=None, examples=["Hi Ocelot, a special offer"])
     nickname: str | None = Field(default=None, description="A nickname the message addressed you by.")
     surname_variant: str | None = Field(default=None, description="A surname the message used.")
-    user_id: int | None = Field(
-        default=None, gt=0, le=MAX_BIGINT,
-        description="Owner scope to search. Omit for signups without a user. Not authenticated.",
-    )
     record_incident: bool = Field(
         default=False, description="Opt in to saving the result as a suspected incident."
     )

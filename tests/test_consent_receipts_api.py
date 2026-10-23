@@ -14,6 +14,7 @@ from backend.main import app
 from backend.models import ConsentReceipt, Signup, User
 from backend.routes.dashboard import DashboardConfig, get_dashboard_config
 from backend.schemas.consent_receipt import sha256_of
+from tests.auth_support import make_account, sign_in
 
 pytestmark = pytest.mark.integration
 
@@ -21,32 +22,49 @@ NOTICE = "We may share your data with partners.\nLast updated 2026-01-15."
 
 
 @pytest.fixture
-def client(session: Session):
+def accounts(session: Session) -> dict:
+    return {"alice": make_account(session, "alice@example.com"), "bob": make_account(session, "bob@example.com")}
+
+
+def local_client(session: Session) -> TestClient:
     app.dependency_overrides[get_db] = lambda: session
     app.dependency_overrides[get_dashboard_config] = lambda: DashboardConfig(enabled=True)
-    yield TestClient(app, client=("127.0.0.1", 50000))
+    return TestClient(app, client=("127.0.0.1", 50000))
+
+
+@pytest.fixture
+def client(session: Session, accounts):
+    """Signed in as Alice."""
+    client = local_client(session)
+    sign_in(client, session, accounts["alice"])
+    yield client
     app.dependency_overrides.clear()
 
 
 @pytest.fixture
-def data(session: Session) -> dict:
-    alice, bob = User(), User()
-    session.add_all([alice, bob])
-    session.flush()
-    shop = Signup(site_name="Example Shop", site_domain="shop.example.com", alias="ab12@leaktrap.xyz",
+def bob_client(session: Session, accounts, client):
+    bob = local_client(session)
+    sign_in(bob, session, accounts["bob"])
+    return bob
+
+
+@pytest.fixture
+def data(session: Session, accounts) -> dict:
+    alice, bob = accounts["alice"].id, accounts["bob"].id
+    shop = Signup(user_id=alice, site_name="Example Shop", site_domain="shop.example.com", alias="ab12@leaktrap.xyz",
                   nickname="Ocelot")
-    news = Signup(site_name="Daily News")
-    alice_bank = Signup(user_id=alice.id, site_name="Alice Bank", site_domain="bank.example",
+    news = Signup(user_id=alice, site_name="Daily News")
+    alice_bank = Signup(user_id=alice, site_name="Alice Bank", site_domain="bank.example",
                         alias="ef56@leaktrap.xyz", nickname="Kestrel")
-    bob_forum = Signup(user_id=bob.id, site_name="Bob Forum")
-    session.add_all([shop, news, alice_bank, bob_forum])
+    bob_forum = Signup(user_id=bob, site_name="Bob Forum")
+    historical = Signup(site_name="Historical Forum", alias="hist@leaktrap.xyz")
+    session.add_all([shop, news, alice_bank, bob_forum, historical])
     session.commit()
-    return {"alice": alice.id, "bob": bob.id, "shop": shop.id, "news": news.id,
-            "alice_bank": alice_bank.id, "bob_forum": bob_forum.id}
+    return {"alice": alice, "bob": bob, "shop": shop.id, "news": news.id,
+            "alice_bank": alice_bank.id, "bob_forum": bob_forum.id, "historical": historical.id}
 
 
-def create(client, body, user_id=None):
-    params = {"user_id": user_id} if user_id else {}
+def create(client, body, **params):
     return client.post("/consent-receipts", json=body, params=params)
 
 
@@ -75,7 +93,7 @@ def test_create_full_receipt(client, session, data) -> None:
 
     session.expire_all()
     stored = session.get(ConsentReceipt, r["id"])
-    assert stored.user_id is None  # owner copied from the signup
+    assert stored.user_id == data["alice"]  # owner copied from the signup
     assert stored.capture_source == "manual"
     assert stored.created_at.tzinfo is not None
 
@@ -91,30 +109,27 @@ def test_hash_only_receipt_stores_no_text(client, session, data) -> None:
 
 def test_owner_is_taken_from_signup(client, session, data) -> None:
     r = create(client, {"signup_id": data["alice_bank"], "action": "declined",
-                        "source_url": "https://bank.example/privacy"}, user_id=data["alice"]).json()
+                        "source_url": "https://bank.example/privacy"}).json()
     session.expire_all()
     assert session.get(ConsentReceipt, r["id"]).user_id == data["alice"]
 
 
-@pytest.mark.parametrize(
-    ("signup_key", "scope_key"),
-    [("alice_bank", None), ("alice_bank", "bob"), ("bob_forum", "alice"), ("shop", "alice"), ("missing", None)],
-)
-def test_cannot_attach_to_signup_outside_scope(client, session, data, signup_key, scope_key) -> None:
-    signup_id = data.get(signup_key, 987654321)
+@pytest.mark.parametrize("signup_key", ["bob_forum", "historical", "missing"])
+def test_cannot_attach_to_another_users_or_unowned_signup(client, session, data, signup_key) -> None:
     before = receipt_count(session)
-    response = create(client, {"signup_id": signup_id, "action": "accepted",
-                               "source_url": "https://x.example/p"},
-                      user_id=data[scope_key] if scope_key else None)
+    response = create(client, {"signup_id": data.get(signup_key, 987654321), "action": "accepted",
+                               "source_url": "https://x.example/p"})
     assert response.status_code == 404
-    assert response.json() == {"detail": "Signup not found in this scope"}
+    assert response.json() == {"detail": "Signup not found"}
     assert receipt_count(session) == before
 
 
-def test_unknown_scope_user_is_422(client, data) -> None:
-    response = create(client, {"signup_id": data["shop"], "action": "accepted",
-                               "source_url": "https://x.example/p"}, user_id=987654321)
-    assert response.status_code == 422
+def test_user_id_cannot_be_chosen_by_the_client(client, session, data) -> None:
+    before = receipt_count(session)
+    body = {"signup_id": data["bob_forum"], "action": "accepted", "source_url": "https://x.example/p"}
+    assert create(client, body, user_id=data["bob"]).status_code == 404  # query parameter ignored
+    assert create(client, {**body, "user_id": data["bob"]}).status_code == 422  # body field rejected
+    assert receipt_count(session) == before
 
 
 def test_list_pagination_and_retrieval(client, data) -> None:
@@ -137,7 +152,9 @@ def test_filter_by_signup(client, data) -> None:
     create(client, {"signup_id": data["news"], "action": "accepted", "source_url": "https://b.example/p"})
     page = client.get("/consent-receipts", params={"signup_id": data["news"]}).json()
     assert [r["site_name"] for r in page["items"]] == ["Daily News"]
-    assert client.get("/consent-receipts", params={"signup_id": data["alice_bank"]}).status_code == 404
+    assert client.get("/consent-receipts", params={"signup_id": data["alice_bank"]}).json()["items"] == []
+    for other in ("bob_forum", "historical"):  # not Alice's: indistinguishable from nonexistent
+        assert client.get("/consent-receipts", params={"signup_id": data[other]}).status_code == 404
 
 
 def test_empty_list(client, data) -> None:
@@ -145,25 +162,23 @@ def test_empty_list(client, data) -> None:
     assert (page["items"], page["total"]) == ([], 0)
 
 
-def test_unknown_and_out_of_scope_receipts_are_404(client, data) -> None:
-    alice_receipt = create(client, {"signup_id": data["alice_bank"], "action": "accepted",
-                                    "source_url": "https://bank.example/p"}, user_id=data["alice"]).json()["id"]
+def test_other_users_receipts_are_404(client, bob_client, data) -> None:
+    bob_receipt = create(bob_client, {"signup_id": data["bob_forum"], "action": "accepted",
+                                      "source_url": "https://bob.example/p"}).json()["id"]
     assert client.get("/consent-receipts/987654321").status_code == 404
-    assert client.get(f"/consent-receipts/{alice_receipt}").status_code == 404
-    assert client.get(f"/consent-receipts/{alice_receipt}", params={"user_id": data["bob"]}).status_code == 404
-    assert client.get(f"/consent-receipts/{alice_receipt}", params={"user_id": data["alice"]}).status_code == 200
+    assert client.get(f"/consent-receipts/{bob_receipt}").status_code == 404
+    assert client.get(f"/consent-receipts/{bob_receipt}", params={"user_id": data["bob"]}).status_code == 404
+    assert bob_client.get(f"/consent-receipts/{bob_receipt}").status_code == 200
+    assert client.get("/consent-receipts", params={"signup_id": data["bob_forum"]}).status_code == 404
 
 
-def test_scopes_do_not_leak(client, data) -> None:
-    create(client, {"signup_id": data["alice_bank"], "action": "accepted",
-                    "source_url": "https://bank.example/p"}, user_id=data["alice"])
+def test_lists_do_not_leak_between_users(client, bob_client, data) -> None:
+    create(bob_client, {"signup_id": data["bob_forum"], "action": "accepted", "source_url": "https://bob.example/p"})
     create(client, {"signup_id": data["shop"], "action": "accepted", "source_url": "https://shop.example.com/p"})
-    unowned = client.get("/consent-receipts").text
-    alice = client.get("/consent-receipts", params={"user_id": data["alice"]}).text
-    bob = client.get("/consent-receipts", params={"user_id": data["bob"]}).json()
-    assert "Alice Bank" not in unowned and "Example Shop" in unowned
-    assert "Alice Bank" in alice and "Example Shop" not in alice
-    assert bob["total"] == 0
+    alice = client.get("/consent-receipts").text
+    bob = bob_client.get("/consent-receipts").json()
+    assert "Bob Forum" not in alice and "Example Shop" in alice
+    assert [r["site_name"] for r in bob["items"]] == ["Bob Forum"]
 
 
 def test_responses_exclude_unrelated_signup_fields(client, data) -> None:
@@ -183,7 +198,7 @@ def test_untrusted_text_is_returned_as_plain_data(client, data) -> None:
 
 
 def test_legacy_receipts_are_labelled_unknown_not_verified(client, session, data) -> None:
-    session.add(ConsentReceipt(signup_id=data["shop"], privacy_notice_text="Old notice"))
+    session.add(ConsentReceipt(user_id=data["alice"], signup_id=data["shop"], privacy_notice_text="Old notice"))
     session.commit()
     [legacy] = client.get("/consent-receipts").json()["items"]
     assert (legacy["action"], legacy["capture_source"], legacy["evidence_basis"]) == (None, None, "unknown")
@@ -218,4 +233,4 @@ def test_list_uses_bounded_queries(client, session, data) -> None:
         assert client.get("/consent-receipts", params={"limit": 100}).status_code == 200
     finally:
         event.remove(engine, "before_cursor_execute", listener)
-    assert 1 <= len(statements) <= 2, statements
+    assert 1 <= len(statements) <= 4, statements  # session + user lookup, count, page

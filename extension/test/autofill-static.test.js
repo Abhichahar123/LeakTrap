@@ -52,7 +52,7 @@ test("observer is bounded and cleaned up", () => {
   assert.match(code, /OBSERVE_MS = 120_000/);
   assert.match(code, /MAX_RESCANS = 40/);
   assert.match(code, /port\.onDisconnect\.addListener\(stop\)/);
-  assert.match(code, /signature === lastSignature\) return/);
+  assert.match(code, /signature === lastSignature && !force\) return/);
 });
 
 test("only connections from this extension are accepted", () => {
@@ -69,4 +69,44 @@ test("popup: alias lookup only on an explicit click; fill only from the Fill but
   assert.equal(popup.match(/state\.api\.createSignup\(/g).length, 1);
   const create = popup.slice(popup.indexOf("function createFromAutofill"), popup.indexOf("// ---------- start"));
   assert.ok(!create.includes("createSignup") && !create.includes("requestSubmit"));
+});
+
+test("'Fill form on this page' only opens the per-field review; filling still needs the Fill button", () => {
+  const start = popup.indexOf("function offerFill(");
+  const offer = popup.slice(start, popup.indexOf("\nfunction ", start + 1));
+  assert.ok(offer.length > 0);
+  assert.ok(!offer.includes('type: "fill"') && !offer.includes("postMessage"), "offerFill must not fill");
+  assert.match(offer, /fillTargetCheck\(signup, state\.host\)/);
+  assert.match(offer, /renderSuggestion\(\)/);
+});
+
+test("the tab hostname comes from the browser tab URL, never from the page", () => {
+  assert.match(popup, /state\.host = host;/);
+  assert.match(popup, /const host = hostnameFromTabUrl\(state\.tabUrl\);/);
+  assert.ok(!/message\.(host|hostname|url)/.test(popup));
+});
+
+test("an outdated extension without the scripting permission explains how to fix it", () => {
+  assert.match(popup, /if \(!chrome\.scripting\?\.executeScript\)/);
+  assert.match(popup, /click the reload icon on LeakTrace/);
+});
+
+test("injection or connection failures are reported, not silent", () => {
+  assert.match(popup, /autofill\.unavailable = "LeakTrace can't look at the fields on this page\."/);
+  assert.match(popup, /autofill\.unavailable = "Lost the connection to this page/);
+});
+
+test("Fill form rescans first and distinguishes 'no answer' from 'no fields'", () => {
+  const start = popup.indexOf("async function offerFill(");
+  const offer = popup.slice(start, popup.indexOf("\nfunction ", start + 1));
+  assert.match(offer, /await requestRescan\(\)/);
+  assert.match(offer, /The page didn't answer LeakTrace/);
+  assert.match(offer, /No supported email, username or nickname fields were found on this page\./);
+  assert.match(code, /message\?\.type === "rescan"/);
+});
+
+test("detector stats contain only counts", () => {
+  const scanBody = code.slice(code.indexOf("function scan()"), code.indexOf("const nativeValueSetter"));
+  assert.match(scanBody, /const stats = \{ inputs: 0, password: 0, hidden: 0, type: 0, sensitive: 0, phone: 0, unrecognized: 0, unreadableFrames: 0 \}/);
+  for (const m of scanBody.matchAll(/stats(?:\.(\w+)|\[(\w+)\])\s*(\+=|=)/g)) assert.ok(m[3] === "+=", m[0]);
 });

@@ -1,5 +1,7 @@
-// LeakTrace local dashboard. Plain JavaScript, no dependencies.
+// LeakTrace personal dashboard. Plain JavaScript, no dependencies.
 // All data is rendered with textContent / DOM nodes, never as HTML.
+// Signed-in state lives in an HttpOnly session cookie; every state-changing
+// request also sends the CSRF token returned by /auth/me.
 "use strict";
 
 const API = "/dashboard/api";
@@ -8,19 +10,23 @@ const STATUS_LABELS = {
   matched: "Matched", ambiguous: "Ambiguous", no_match: "No match", unprocessed: "Unprocessed",
 };
 const ACTION_LABELS = { accepted: "Accepted", declined: "Declined", notice_only: "Only saw the notice" };
-const state = { userId: null, offsets: { signups: 0, emails: 0, receipts: 0 }, emailStatus: "" };
+const state = {
+  me: null, offsets: { websites: 0, receipts: 0, emails: 0, investigations: 0 },
+  emailStatus: "", websiteQuery: "", websiteFilter: "all", pairCode: null,
+};
 
 // ---------- helpers ----------
 
 function el(tag, attrs = {}, ...children) {
   const node = document.createElement(tag);
   for (const [key, value] of Object.entries(attrs)) {
+    if (value === undefined || value === null || value === false) continue;
     if (key === "class") node.className = value;
     else if (key.startsWith("on")) node.addEventListener(key.slice(2), value);
-    else node.setAttribute(key, value);
+    else node.setAttribute(key, value === true ? "" : value);
   }
-  for (const child of children) {
-    if (child !== null && child !== undefined) node.append(child instanceof Node ? child : String(child));
+  for (const child of children.flat()) {
+    if (child !== null && child !== undefined && child !== false) node.append(child instanceof Node ? child : String(child));
   }
   return node;
 }
@@ -48,49 +54,268 @@ function setStatus(section, message, isError = false) {
   box.setAttribute("role", isError ? "alert" : "status");
 }
 
-function scopeQuery(extra = {}) {
-  const params = new URLSearchParams(extra);
-  if (state.userId !== null) params.set("user_id", state.userId);
-  return params.toString();
+function say(id, message, kind = "") {
+  const box = document.getElementById(id);
+  box.textContent = message;
+  box.className = `status ${kind}`.trim();
+  box.setAttribute("role", kind === "error" ? "alert" : "status");
 }
 
-async function getJSON(url, options) {
+function siteLabel(name, domain) {
+  return name ? `${name}${domain ? ` (${domain})` : ""}` : "—";
+}
+
+// Form labels for request fields, used in validation messages.
+const FIELD_LABELS = {
+  signup_id: "Signup ID", action: "What you did", source_url: "Privacy notice URL",
+  notice_version: "Notice version", notice_text: "Notice text", content_hash: "Notice text hash",
+  consent_text: "Consent prompt wording", reported_occurred_at: "When it happened",
+  recipient: "Recipient address", sender: "Sender address", subject: "Subject", nickname: "Nickname",
+  surname_variant: "Surname", user_id: "User ID", limit: "Page size", offset: "Page position", status: "Status filter",
+  email: "Email", password: "Password", current_password: "Current password", new_password: "New password",
+  confirm: "Confirmation", code: "Code", filter: "Show",
+};
+const MAX_SHOWN_ERRORS = 3;
+
+class RequestError extends Error {
+  constructor(message, fields = [], status = 0) {
+    super(message);
+    this.fields = fields;
+    this.status = status;
+  }
+}
+
+function humanizeFields(text, keys) {
+  return keys.reduce((out, key) => out.replace(new RegExp(`\\b${key}\\b`, "g"), FIELD_LABELS[key]), text);
+}
+
+/**
+ * Field-specific messages from a 422 "detail" list. Only each error's location
+ * and reason are used; submitted values (FastAPI's "input") are never shown.
+ */
+function validationErrors(detail) {
+  return detail.filter((d) => d && typeof d === "object").map((d) => {
+    const loc = Array.isArray(d.loc) ? d.loc.filter((p) => typeof p === "string" && !["body", "query", "path"].includes(p)) : [];
+    const field = loc.at(-1) ?? null;
+    let message = String(d.msg ?? "is invalid").replace(/^Value error, /, "");
+    if (message === "Extra inputs are not permitted") message = "is not an accepted field";
+    if (field && message.startsWith(`${field} `)) message = message.slice(field.length + 1);
+    // Field-specific messages may name other fields; form-level ones list them.
+    const keys = Object.keys(FIELD_LABELS).filter((k) => !field || k.includes("_"));
+    message = humanizeFields(message, keys);
+    if (!field) return { field, text: message.charAt(0).toUpperCase() + message.slice(1) };
+    return { field, text: `${FIELD_LABELS[field] ?? field}: ${message}` };
+  });
+}
+
+function validationSummary(errors) {
+  if (!errors.length) return "The request was not accepted. Check the highlighted values.";
+  const shown = errors.slice(0, MAX_SHOWN_ERRORS).map((e) => e.text).join("; ");
+  const more = errors.length - MAX_SHOWN_ERRORS;
+  return more > 0 ? `${shown}; and ${more} more.` : `${shown}.`;
+}
+
+/**
+ * Mark the form controls named in the errors, link them to the message that
+ * explains the problem, and focus the first one.
+ */
+function markInvalid(form, fields = [], messageId = null) {
+  for (const control of form.elements) {
+    control.removeAttribute("aria-invalid");
+    if (control.getAttribute("aria-describedby") === messageId) control.removeAttribute("aria-describedby");
+  }
+  const names = fields.map((f) => (f === "content_hash" ? "notice_text" : f));
+  const controls = names.map((n) => form.elements.namedItem(n)).filter((c) => c && c.setAttribute);
+  for (const control of controls) {
+    control.setAttribute("aria-invalid", "true");
+    if (messageId) control.setAttribute("aria-describedby", messageId);
+  }
+  controls[0]?.focus();
+}
+
+/** Same-origin JSON request. Sends the CSRF token on state-changing methods. */
+async function api(url, { method = "GET", body } = {}) {
+  const headers = { accept: "application/json" };
+  if (body !== undefined) headers["content-type"] = "application/json";
+  if (method !== "GET" && state.me?.csrf_token) headers["x-csrf-token"] = state.me.csrf_token;
   let response;
   try {
-    response = await fetch(url, { headers: { accept: "application/json" }, ...options });
+    response = await fetch(url, { method, headers, credentials: "same-origin", cache: "no-store",
+      body: body === undefined ? undefined : JSON.stringify(body) });
   } catch {
-    throw new Error("Could not reach the LeakTrace server.");
+    throw new RequestError("Could not reach the LeakTrace server.");
   }
-  let body = null;
-  try { body = await response.json(); } catch { /* non-JSON error page */ }
+  let data = null;
+  try { data = await response.json(); } catch { /* empty or non-JSON */ }
+  if (response.status === 401 && state.me && !url.startsWith("/auth/login")) {
+    signedOut("Your session ended. Sign in again.");
+    throw new RequestError("Your session ended. Sign in again.", [], 401);
+  }
   if (!response.ok) {
-    const detail = typeof body?.detail === "string" ? body.detail
-      : Array.isArray(body?.detail) ? "Some values are invalid." : `Request failed (HTTP ${response.status}).`;
-    throw new Error(detail);
+    if (typeof data?.detail === "string") throw new RequestError(data.detail, [], response.status);
+    if (Array.isArray(data?.detail)) {
+      const errors = validationErrors(data.detail);
+      throw new RequestError(validationSummary(errors), errors.map((e) => e.field).filter(Boolean), response.status);
+    }
+    throw new RequestError(`Request failed (HTTP ${response.status}).`, [], response.status);
   }
-  return body;
+  return data ?? {};
 }
+
+const getJSON = (url) => api(url);
 
 function renderPager(name, page, reload) {
   const pager = document.querySelector(`[data-pager="${name}"]`);
   const from = page.total === 0 ? 0 : page.offset + 1;
   const to = page.offset + page.items.length;
   pager.replaceChildren(
-    el("button", {
-      type: "button", "aria-label": "Previous page",
-      onclick: () => { state.offsets[name] = Math.max(0, page.offset - page.limit); reload(); },
-    }, "Previous"),
+    el("button", { type: "button", "aria-label": "Previous page",
+      onclick: () => { state.offsets[name] = Math.max(0, page.offset - page.limit); reload(); } }, "Previous"),
     el("span", { "aria-live": "polite" }, `${from}–${to} of ${page.total}`),
-    el("button", {
-      type: "button", "aria-label": "Next page",
-      onclick: () => { state.offsets[name] = page.offset + page.limit; reload(); },
-    }, "Next"),
+    el("button", { type: "button", "aria-label": "Next page",
+      onclick: () => { state.offsets[name] = page.offset + page.limit; reload(); } }, "Next"),
   );
   pager.children[0].disabled = page.offset === 0;
   pager.children[2].disabled = to >= page.total;
 }
 
-// ---------- views ----------
+function list(items) {
+  return el("ul", {}, ...items.map((item) => el("li", {}, item)));
+}
+
+function copyButton(label, value) {
+  const button = el("button", { type: "button", class: "secondary" }, `Copy ${label}`);
+  button.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(value);
+      button.textContent = `Copied ${label}`;
+    } catch {
+      button.textContent = `Copy failed — select the ${label} and copy it manually`;
+    }
+  });
+  return button;
+}
+
+// ---------- sign in / out ----------
+
+function show(view) {
+  document.getElementById("auth-view").hidden = view !== "auth";
+  document.getElementById("app-view").hidden = view !== "app";
+  document.getElementById("account-bar").hidden = view !== "app";
+}
+
+function signedOut(message = "") {
+  state.me = null;
+  show("auth");
+  document.getElementById("verify-banner").hidden = true;
+  if (message) say("login-status", message, "error");
+}
+
+function renderVerifyBanner() {
+  const banner = document.getElementById("verify-banner");
+  if (!state.me || state.me.email_verified) {
+    banner.hidden = true;
+    return;
+  }
+  banner.hidden = false;
+  banner.textContent = state.me.email_delivery_configured
+    ? "Your email address is not verified yet. Check your inbox for the verification link."
+    : "Your email address is not verified. Email delivery is not configured on this server, so no verification email has been sent.";
+}
+
+async function signedIn(me) {
+  state.me = me;
+  document.getElementById("account-email").textContent = `Signed in as ${me.email}`;
+  show("app");
+  renderVerifyBanner();
+  showPairCard();
+  selectTab(currentTab());
+}
+
+async function login(event) {
+  event.preventDefault();
+  const form = event.target;
+  markInvalid(form, [], "login-status");
+  say("login-status", "Signing in…");
+  try {
+    const me = await api("/auth/login", { method: "POST", body: {
+      email: form.elements.email.value, password: form.elements.password.value } });
+    form.reset();
+    say("login-status", "");
+    await signedIn(me);
+  } catch (error) {
+    say("login-status", error.message, "error");
+    markInvalid(form, error.fields, "login-status");
+  }
+}
+
+async function register(event) {
+  event.preventDefault();
+  const form = event.target;
+  markInvalid(form, [], "register-status");
+  say("register-status", "Creating…");
+  try {
+    const result = await api("/auth/register", { method: "POST", body: {
+      email: form.elements.email.value, password: form.elements.password.value } });
+    document.getElementById("login-email").value = form.elements.email.value;
+    form.reset();
+    say("register-status", result.detail, "ok");
+    document.getElementById("login-password").focus();
+  } catch (error) {
+    say("register-status", error.message, "error");
+    markInvalid(form, error.fields, "register-status");
+  }
+}
+
+async function signOut() {
+  try {
+    await api("/auth/logout", { method: "POST" });
+  } catch {
+    // Signed out locally either way.
+  }
+  signedOut();
+  say("login-status", "Signed out.", "ok");
+}
+
+// ---------- extension pairing approval ----------
+
+function readPairCode() {
+  const match = /^#pair=([A-Za-z2-9]{4}-?[A-Za-z2-9]{4})$/.exec(location.hash);
+  return match ? match[1].toUpperCase() : null;
+}
+
+function showPairCard() {
+  const card = document.getElementById("pair-card");
+  card.hidden = !state.pairCode;
+  if (!state.pairCode) return;
+  document.getElementById("pair-code").textContent = state.pairCode;
+  say("pair-status", "");
+  card.focus();
+}
+
+function clearPairing() {
+  state.pairCode = null;
+  history.replaceState(null, "", location.pathname + location.search);
+  document.getElementById("pair-card").hidden = true;
+}
+
+async function approvePairing() {
+  const button = document.getElementById("pair-approve");
+  button.disabled = true;
+  say("pair-status", "Approving…");
+  try {
+    const result = await api("/extension/pairings/approve", { method: "POST", body: { code: state.pairCode } });
+    say("pair-status", result.detail, "ok");
+    state.pairCode = null;
+    history.replaceState(null, "", location.pathname + location.search);
+  } catch (error) {
+    say("pair-status", error.message, "error");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+// ---------- overview ----------
 
 async function loadOverview() {
   const section = document.getElementById("view-overview");
@@ -98,128 +323,73 @@ async function loadOverview() {
   setStatus(section, "Loading…");
   cards.replaceChildren();
   try {
-    const data = await getJSON(`${API}/overview?${scopeQuery()}`);
+    const d = await getJSON(`${API}/overview`);
     const entries = [
-      ["Signups", data.signups_total], ["Ingested emails", data.emails_total],
-      ["Matched", data.matched], ["Ambiguous", data.ambiguous],
-      ["No match", data.no_match], ["Unprocessed", data.unprocessed],
+      ["Websites tracked", d.websites], ["Aliases", d.aliases], ["Nicknames", d.nicknames],
+      ["Consent receipts", d.receipts], ["Emails received", d.emails_total], ["Matched", d.matched],
+      ["Ambiguous", d.ambiguous], ["No match", d.no_match], ["Investigations", d.investigations],
     ];
     cards.replaceChildren(...entries.map(([label, value]) => el("div", {}, el("dt", {}, label), el("dd", {}, value))));
-    setStatus(section, data.emails_total === 0 && data.signups_total === 0 ? "No records in this scope yet." : "");
+    setStatus(section, d.websites === 0 ? "No websites yet. Create a signup with the LeakTrace extension to start." : "");
   } catch (error) {
     setStatus(section, error.message, true);
   }
 }
 
-async function loadSignups() {
-  const section = document.getElementById("view-signups");
-  const body = document.getElementById("signups-body");
+// ---------- my websites ----------
+
+async function loadWebsites() {
+  const section = document.getElementById("view-websites");
+  const body = document.getElementById("websites-body");
   setStatus(section, "Loading…");
   body.replaceChildren();
+  const params = new URLSearchParams({ limit: PAGE_SIZE, offset: state.offsets.websites, filter: state.websiteFilter });
+  if (state.websiteQuery) params.set("q", state.websiteQuery);
   try {
-    const page = await getJSON(`${API}/signups?${scopeQuery({ limit: PAGE_SIZE, offset: state.offsets.signups })}`);
-    body.replaceChildren(...page.items.map((s) => {
-      const markers = [s.alias_masked ? "alias" : null, s.has_nickname ? "nickname" : null,
-        s.has_surname_variant ? "surname variant" : null].filter(Boolean).join(", ") || "none";
-      return el("tr", {},
-        el("td", {}, s.site_name),
-        el("td", {}, s.site_domain ?? "—"),
-        el("td", {}, s.alias_masked ?? "—"),
-        el("td", {}, markers + (s.real_name_required ? " · real name required" : "")),
-        el("td", {}, s.email_count),
-        el("td", {}, formatTime(s.created_at)));
-    }));
-    renderPager("signups", page, loadSignups);
-    setStatus(section, page.total === 0 ? "No signups in this scope." : "");
+    const page = await getJSON(`${API}/signups?${params}`);
+    body.replaceChildren(...page.items.map((s) => el("tr", {},
+      el("td", {}, siteLabel(s.site_name, s.site_domain)),
+      el("td", { class: "marker" }, s.alias ?? "—"),
+      el("td", {}, s.nickname ?? (s.real_name_required ? "Real name required" : "—")),
+      el("td", {}, formatTime(s.created_at)),
+      el("td", {}, s.receipt_count),
+      el("td", {}, s.email_count),
+      el("td", {}, el("button", { type: "button", "aria-label": `Show details for ${s.site_name}`,
+        onclick: () => showWebsite(s.id) }, "Details")))));
+    renderPager("websites", page, loadWebsites);
+    const filtered = state.websiteQuery || state.websiteFilter !== "all";
+    setStatus(section, page.total === 0 ? (filtered ? "No websites match this search." : "No websites yet.") : "");
   } catch (error) {
     setStatus(section, error.message, true);
   }
 }
 
-async function loadEmails() {
-  const section = document.getElementById("view-emails");
-  const body = document.getElementById("emails-body");
-  setStatus(section, "Loading…");
-  body.replaceChildren();
-  const params = { limit: PAGE_SIZE, offset: state.offsets.emails };
-  if (state.emailStatus) params.status = state.emailStatus;
-  try {
-    const page = await getJSON(`${API}/emails?${scopeQuery(params)}`);
-    body.replaceChildren(...page.items.map((m) => el("tr", {},
-      el("td", {}, formatTime(m.received_at)),
-      el("td", {}, statusBadge(m.match_status)),
-      el("td", {}, m.match_confidence ?? "—"),
-      el("td", {}, m.site_name ? `${m.site_name}${m.site_domain ? ` (${m.site_domain})` : ""}`
-        : m.recipient_known ? "Known alias" : "Unknown alias"),
-      el("td", {}, m.sender_domain ?? "—"),
-      el("td", {}, el("button", {
-        type: "button", "aria-label": `Show match details for email ${m.id}`,
-        onclick: () => showEmailDetail(m.id),
-      }, "Details")))));
-    renderPager("emails", page, loadEmails);
-    setStatus(section, page.total === 0 ? "No ingested emails in this scope." : "");
-  } catch (error) {
-    setStatus(section, error.message, true);
-  }
-}
-
-function list(items) {
-  return el("ul", {}, ...items.map((item) => el("li", {}, item)));
-}
-
-async function showEmailDetail(id) {
-  const panel = document.getElementById("email-detail");
-  const body = document.getElementById("email-detail-body");
+async function showWebsite(id) {
+  const panel = document.getElementById("website-detail");
+  const body = document.getElementById("website-detail-body");
   panel.hidden = false;
   body.replaceChildren(el("p", { role: "status" }, "Loading…"));
   try {
-    const d = await getJSON(`${API}/emails/${encodeURIComponent(id)}?${scopeQuery()}`);
+    const d = await getJSON(`${API}/signups/${encodeURIComponent(id)}`);
     const rows = [
-      ["Status", statusBadge(d.match_status)], ["Confidence", d.match_confidence ?? "—"],
-      ["Received", formatTime(d.received_at)], ["Recorded", formatTime(d.created_at)],
-      ["Signup", d.signup_id ? `#${d.signup_id} ${d.site_name ?? ""}` : "Recipient alias not recognised"],
-      ["Site domain", d.site_domain ?? "—"], ["Sender domain (claimed)", d.sender_domain ?? "—"],
+      ["Website", d.site_name], ["Domain", d.site_domain ?? "—"], ["Signup ID", `#${d.id}`],
+      ["Alias", d.alias ?? "—"], ["Nickname", d.nickname ?? "—"], ["Surname variant", d.surname_variant ?? "—"],
+      ["Real name required", d.real_name_required ? "Yes" : "No"], ["Signed up", formatTime(d.created_at)],
     ];
     body.replaceChildren(
-      el("p", { class: "notice", role: "note" }, d.notice),
       el("dl", {}, ...rows.flatMap(([k, v]) => [el("dt", {}, k), el("dd", {}, v)])),
-      el("p", { class: "hint" }, d.stored_details),
-      el("h4", {}, "Limitations"), list(d.limitations));
+      el("div", { class: "row" }, d.alias ? copyButton("alias", d.alias) : null, d.nickname ? copyButton("nickname", d.nickname) : null),
+      el("h4", {}, "Consent receipts"),
+      d.receipts.length ? list(d.receipts.map((r) => `${formatTime(r.recorded_at)} — ${ACTION_LABELS[r.action] ?? "Not recorded"}`
+        + `${r.evidence_basis === "user_reported" ? " · user-reported (not verified)" : ""}`)) : el("p", { class: "hint" }, "None yet."),
+      el("h4", {}, "Email received at this alias"),
+      d.emails.length ? list(d.emails.map((m) => el("span", {}, formatTime(m.received_at), " ", statusBadge(m.match_status),
+        m.sender_domain ? ` from ${m.sender_domain} (claimed)` : ""))) : el("p", { class: "hint" }, "None yet."),
+      el("p", { class: "notice", role: "note" }, d.notice));
   } catch (error) {
     body.replaceChildren(el("p", { class: "error", role: "alert" }, error.message));
   }
   panel.focus();
-}
-
-async function runCheck(event) {
-  event.preventDefault();
-  const section = document.getElementById("view-check");
-  const result = document.getElementById("check-result");
-  const payload = {};
-  for (const [key, value] of new FormData(event.target)) {
-    if (String(value).trim()) payload[key] = String(value).trim();
-  }
-  if (state.userId !== null) payload.user_id = state.userId;
-  result.replaceChildren();
-  setStatus(section, "Checking…");
-  try {
-    const r = await getJSON("/matcher/check", {
-      method: "POST", headers: { "content-type": "application/json", accept: "application/json" },
-      body: JSON.stringify(payload),
-    });
-    const matches = r.matches.length === 0 ? [el("p", {}, "No signups in this scope match these clues.")]
-      : r.matches.map((m) => el("article", { class: "result" },
-        el("h4", {}, `${m.site_name}${m.site_domain ? ` (${m.site_domain})` : ""} — confidence: ${m.confidence}`),
-        list(m.signals.map((s) => `${s.type}: ${s.explanation}`))));
-    result.replaceChildren(
-      el("p", {}, "Result: ", statusBadge(r.status), ` confidence: ${r.confidence}`),
-      ...matches,
-      ...(r.warnings.length ? [el("h4", {}, "Warnings"), list(r.warnings)] : []),
-      el("h4", {}, "Limitations"), list(r.limitations));
-    setStatus(section, "");
-  } catch (error) {
-    setStatus(section, error.message, true);
-  }
 }
 
 // ---------- consent receipts ----------
@@ -238,24 +408,22 @@ async function loadReceipts() {
   setStatus(section, "Loading…");
   body.replaceChildren();
   try {
-    const page = await getJSON(`/consent-receipts?${scopeQuery({ limit: PAGE_SIZE, offset: state.offsets.receipts })}`);
+    const page = await getJSON(`/consent-receipts?${new URLSearchParams({ limit: PAGE_SIZE, offset: state.offsets.receipts })}`);
     body.replaceChildren(...page.items.map((r) => {
       const kept = [r.source_url ? "URL" : null, r.content_hash ? "hash" : null,
         r.notice_text_stored ? "notice text" : null, r.consent_text_stored ? "consent wording" : null,
         r.notice_version ? "version" : null].filter(Boolean).join(", ") || "none";
       return el("tr", {},
         el("td", {}, formatTime(r.recorded_at)),
-        el("td", {}, r.site_name ? `${r.site_name}${r.site_domain ? ` (${r.site_domain})` : ""}` : "Signup deleted"),
+        el("td", {}, r.site_name ? siteLabel(r.site_name, r.site_domain) : "Signup deleted"),
         el("td", {}, actionLabel(r.action)),
         el("td", {}, sourceLabel(r)),
         el("td", {}, kept),
-        el("td", {}, el("button", {
-          type: "button", "aria-label": `Show details for receipt ${r.id}`,
-          onclick: () => showReceiptDetail(r.id),
-        }, "Details")));
+        el("td", {}, el("button", { type: "button", "aria-label": `Show details for receipt ${r.id}`,
+          onclick: () => showReceiptDetail(r.id) }, "Details")));
     }));
     renderPager("receipts", page, loadReceipts);
-    setStatus(section, page.total === 0 ? "No consent receipts in this scope yet." : "");
+    setStatus(section, page.total === 0 ? "No consent receipts yet." : "");
   } catch (error) {
     setStatus(section, error.message, true);
   }
@@ -267,9 +435,9 @@ async function showReceiptDetail(id) {
   panel.hidden = false;
   body.replaceChildren(el("p", { role: "status" }, "Loading…"));
   try {
-    const r = await getJSON(`/consent-receipts/${encodeURIComponent(id)}?${scopeQuery()}`);
+    const r = await getJSON(`/consent-receipts/${encodeURIComponent(id)}`);
     const rows = [
-      ["Site", r.site_name ? `${r.site_name}${r.site_domain ? ` (${r.site_domain})` : ""}` : "Signup deleted"],
+      ["Site", r.site_name ? siteLabel(r.site_name, r.site_domain) : "Signup deleted"],
       ["Reported action", actionLabel(r.action)],
       ["Source", sourceLabel(r)],
       ["Recorded by LeakTrace (server time)", formatTime(r.recorded_at)],
@@ -303,6 +471,7 @@ async function createReceipt(event) {
   const form = event.target;
   const status = document.getElementById("receipt-form-status");
   status.classList.remove("error");
+  markInvalid(form, [], "receipt-form-status");
   status.textContent = "Saving…";
   try {
     const payload = {};
@@ -312,17 +481,14 @@ async function createReceipt(event) {
     payload.signup_id = Number(payload.signup_id);
     if (payload.reported_occurred_at) {
       const when = new Date(payload.reported_occurred_at);
-      if (Number.isNaN(when.getTime())) throw new Error("The event time is not a valid date.");
+      if (Number.isNaN(when.getTime())) throw new RequestError("When it happened: not a valid date.", ["reported_occurred_at"]);
       payload.reported_occurred_at = when.toISOString();
     }
     if (payload.notice_text && !document.getElementById("receipt-store-text").checked) {
       payload.content_hash = await sha256Hex(payload.notice_text);
       delete payload.notice_text;
     }
-    const saved = await getJSON(`/consent-receipts?${scopeQuery()}`, {
-      method: "POST", headers: { "content-type": "application/json", accept: "application/json" },
-      body: JSON.stringify(payload),
-    });
+    const saved = await api("/consent-receipts", { method: "POST", body: payload });
     form.reset();
     status.textContent = `Saved receipt ${saved.id} as user-reported.`;
     state.offsets.receipts = 0;
@@ -330,13 +496,208 @@ async function createReceipt(event) {
   } catch (error) {
     status.textContent = error.message;
     status.classList.add("error");
+    markInvalid(form, error.fields, "receipt-form-status");
   }
 }
 
-// ---------- tabs and scope ----------
+// ---------- leak activity ----------
+
+async function loadActivity() {
+  await Promise.all([loadEmails(), loadInvestigations()]);
+}
+
+async function loadEmails() {
+  const section = document.getElementById("view-activity");
+  const body = document.getElementById("emails-body");
+  setStatus(section, "Loading…");
+  body.replaceChildren();
+  const params = new URLSearchParams({ limit: PAGE_SIZE, offset: state.offsets.emails });
+  if (state.emailStatus) params.set("status", state.emailStatus);
+  try {
+    const page = await getJSON(`${API}/emails?${params}`);
+    body.replaceChildren(...page.items.map((m) => el("tr", {},
+      el("td", {}, formatTime(m.received_at)),
+      el("td", {}, statusBadge(m.match_status)),
+      el("td", {}, m.match_confidence ?? "—"),
+      el("td", {}, m.site_name ? siteLabel(m.site_name, m.site_domain) : m.recipient_known ? "Known alias" : "Unknown alias"),
+      el("td", {}, m.sender_domain ?? "—"),
+      el("td", {}, el("button", { type: "button", "aria-label": `Show match details for email ${m.id}`,
+        onclick: () => showEmailDetail(m.id) }, "Details")))));
+    renderPager("emails", page, loadEmails);
+    setStatus(section, page.total === 0 ? "No email received at your aliases yet." : "");
+  } catch (error) {
+    setStatus(section, error.message, true);
+  }
+}
+
+async function showEmailDetail(id) {
+  const panel = document.getElementById("email-detail");
+  const body = document.getElementById("email-detail-body");
+  panel.hidden = false;
+  body.replaceChildren(el("p", { role: "status" }, "Loading…"));
+  try {
+    const d = await getJSON(`${API}/emails/${encodeURIComponent(id)}`);
+    const rows = [
+      ["Status", statusBadge(d.match_status)], ["Confidence", d.match_confidence ?? "—"],
+      ["Received", formatTime(d.received_at)], ["Recorded", formatTime(d.created_at)],
+      ["Website", d.signup_id ? `#${d.signup_id} ${siteLabel(d.site_name, d.site_domain)}` : "Recipient alias not recognised"],
+      ["Sender domain (claimed)", d.sender_domain ?? "—"],
+    ];
+    body.replaceChildren(
+      el("p", { class: "notice", role: "note" }, d.notice),
+      el("dl", {}, ...rows.flatMap(([k, v]) => [el("dt", {}, k), el("dd", {}, v)])),
+      el("p", { class: "hint" }, d.stored_details),
+      el("h4", {}, "Limitations"), list(d.limitations));
+  } catch (error) {
+    body.replaceChildren(el("p", { class: "error", role: "alert" }, error.message));
+  }
+  panel.focus();
+}
+
+async function loadInvestigations() {
+  const body = document.getElementById("investigations-body");
+  say("investigations-status", "Loading…");
+  body.replaceChildren();
+  try {
+    const page = await getJSON(`${API}/investigations?${new URLSearchParams({ limit: PAGE_SIZE, offset: state.offsets.investigations })}`);
+    body.replaceChildren(...page.items.map((i) => el("tr", {},
+      el("td", {}, formatTime(i.created_at)),
+      el("td", {}, statusBadge(i.result)),
+      el("td", {}, i.confidence ?? "—"),
+      el("td", {}, i.matched_site ?? (i.candidate_count ? `${i.candidate_count} possible websites` : "—")),
+      el("td", {}, i.signal_types.join(", ") || "—"),
+      el("td", {}, i.sender_domain ?? "—"))));
+    renderPager("investigations", page, loadInvestigations);
+    say("investigations-status", page.total === 0 ? "No investigations recorded yet." : "");
+  } catch (error) {
+    say("investigations-status", error.message, "error");
+  }
+}
+
+// ---------- match check ----------
+
+async function runCheck(event) {
+  event.preventDefault();
+  const section = document.getElementById("view-check");
+  const result = document.getElementById("check-result");
+  const payload = {};
+  for (const [key, value] of new FormData(event.target)) {
+    if (String(value).trim()) payload[key] = String(value).trim();
+  }
+  if (document.getElementById("check-record").checked) payload.record_incident = true;
+  result.replaceChildren();
+  markInvalid(event.target, [], "check-status");
+  setStatus(section, "Checking…");
+  try {
+    const r = await api("/matcher/check", { method: "POST", body: payload });
+    const matches = r.matches.length === 0 ? [el("p", {}, "None of your websites match these clues.")]
+      : r.matches.map((m) => el("article", { class: "result" },
+        el("h4", {}, `${siteLabel(m.site_name, m.site_domain)} — confidence: ${m.confidence}`),
+        list(m.signals.map((s) => `${s.type}: ${s.explanation}`))));
+    result.replaceChildren(
+      el("p", {}, "Result: ", statusBadge(r.status), ` confidence: ${r.confidence}`),
+      ...matches,
+      ...(r.warnings.length ? [el("h4", {}, "Warnings"), list(r.warnings)] : []),
+      el("h4", {}, "Limitations"), list(r.limitations),
+      r.incident_id ? el("p", { class: "hint" }, "Recorded under Leak activity.") : null);
+    setStatus(section, "");
+  } catch (error) {
+    setStatus(section, error.message, true);
+    markInvalid(event.target, error.fields, "check-status");
+  }
+}
+
+// ---------- settings ----------
+
+async function loadSettings() {
+  const section = document.getElementById("view-settings");
+  setStatus(section, "");
+  const me = state.me;
+  document.getElementById("account-details").replaceChildren(
+    el("dt", {}, "Email"), el("dd", {}, me.email),
+    el("dt", {}, "Verification"), el("dd", {}, me.email_verified ? "Verified" : "Not verified"));
+  document.getElementById("resend-verification").hidden = me.email_verified;
+  await loadExtensions();
+}
+
+async function loadExtensions() {
+  const listBox = document.getElementById("extensions-list");
+  say("extensions-status", "Loading…");
+  listBox.replaceChildren();
+  try {
+    const sessions = await getJSON("/extension/sessions");
+    listBox.replaceChildren(...sessions.map((s) => el("li", {},
+      `${s.label ?? "Browser extension"} — connected ${formatTime(s.created_at)}, last used ${formatTime(s.last_used_at)}, expires ${formatTime(s.expires_at)} `,
+      el("button", { type: "button", class: "secondary", "aria-label": `Revoke extension connection ${s.id}`,
+        onclick: () => revokeExtension(s.id) }, "Revoke"))));
+    say("extensions-status", sessions.length ? "" : "No browser extension is connected.");
+  } catch (error) {
+    say("extensions-status", error.message, "error");
+  }
+}
+
+async function revokeExtension(id) {
+  try {
+    await api(`/extension/sessions/${encodeURIComponent(id)}`, { method: "DELETE" });
+    await loadExtensions();
+    say("extensions-status", "Connection revoked. That extension can no longer use your account.", "ok");
+  } catch (error) {
+    say("extensions-status", error.message, "error");
+  }
+}
+
+async function resendVerification() {
+  try {
+    const result = await api("/auth/verification/resend", { method: "POST" });
+    say("verification-status", result.detail, result.verification_email_sent ? "ok" : "");
+  } catch (error) {
+    say("verification-status", error.message, "error");
+  }
+}
+
+async function changePassword(event) {
+  event.preventDefault();
+  const form = event.target;
+  markInvalid(form, [], "password-status");
+  say("password-status", "Saving…");
+  try {
+    await api("/auth/password", { method: "POST", body: {
+      current_password: form.elements.current_password.value, new_password: form.elements.new_password.value } });
+    form.reset();
+    say("password-status", "Password changed. Your other sessions and browser extensions were signed out.", "ok");
+    await loadExtensions();
+  } catch (error) {
+    say("password-status", error.message, "error");
+    markInvalid(form, error.fields, "password-status");
+  }
+}
+
+async function deleteAccount(event) {
+  event.preventDefault();
+  const form = event.target;
+  markInvalid(form, [], "delete-status");
+  if (form.elements.confirm.value !== "DELETE") {
+    say("delete-status", "Confirmation: type DELETE in capital letters.", "error");
+    markInvalid(form, ["confirm"], "delete-status");
+    return;
+  }
+  say("delete-status", "Deleting…");
+  try {
+    await api("/account", { method: "DELETE", body: { password: form.elements.password.value, confirm: "DELETE" } });
+    form.reset();
+    signedOut();
+    say("login-status", "Your account and its records were deleted.", "ok");
+  } catch (error) {
+    say("delete-status", error.message, "error");
+    markInvalid(form, error.fields, "delete-status");
+  }
+}
+
+// ---------- tabs ----------
 
 const loaders = {
-  overview: loadOverview, signups: loadSignups, emails: loadEmails, check: () => {}, receipts: loadReceipts,
+  overview: loadOverview, websites: loadWebsites, receipts: loadReceipts, activity: loadActivity,
+  check: () => {}, settings: loadSettings,
 };
 
 function selectTab(tab, focus = false) {
@@ -354,7 +715,7 @@ function currentTab() {
   return document.querySelector('[role="tab"][aria-selected="true"]');
 }
 
-document.addEventListener("DOMContentLoaded", () => {
+document.addEventListener("DOMContentLoaded", async () => {
   const tabs = [...document.querySelectorAll('[role="tab"]')];
   for (const tab of tabs) {
     tab.addEventListener("click", () => selectTab(tab));
@@ -366,37 +727,42 @@ document.addEventListener("DOMContentLoaded", () => {
       selectTab(tabs[(next + tabs.length) % tabs.length], true);
     });
   }
-
-  document.getElementById("scope-form").addEventListener("submit", (event) => {
+  document.getElementById("login-form").addEventListener("submit", login);
+  document.getElementById("register-form").addEventListener("submit", register);
+  document.getElementById("sign-out").addEventListener("click", signOut);
+  document.getElementById("pair-approve").addEventListener("click", approvePairing);
+  document.getElementById("pair-cancel").addEventListener("click", clearPairing);
+  document.getElementById("websites-search").addEventListener("submit", (event) => {
     event.preventDefault();
-    const raw = document.getElementById("scope-user").value.trim();
-    const error = document.getElementById("scope-error");
-    if (raw && !/^[1-9]\d{0,18}$/.test(raw)) {
-      error.textContent = "User ID must be a positive whole number.";
-      error.hidden = false;
-      return;
-    }
-    error.hidden = true;
-    state.userId = raw || null;
-    state.offsets = { signups: 0, emails: 0, receipts: 0 };
-    document.getElementById("email-detail").hidden = true;
-    document.getElementById("receipt-detail").hidden = true;
-    selectTab(currentTab());
+    state.websiteQuery = document.getElementById("websites-q").value.trim();
+    state.websiteFilter = document.getElementById("websites-filter").value;
+    state.offsets.websites = 0;
+    loadWebsites();
   });
-
+  document.getElementById("website-detail-close").addEventListener("click", () => { document.getElementById("website-detail").hidden = true; });
+  document.getElementById("receipt-form").addEventListener("submit", createReceipt);
+  document.getElementById("receipt-detail-close").addEventListener("click", () => { document.getElementById("receipt-detail").hidden = true; });
   document.getElementById("email-status").addEventListener("change", (event) => {
     state.emailStatus = event.target.value;
     state.offsets.emails = 0;
     loadEmails();
   });
-  document.getElementById("email-detail-close").addEventListener("click", () => {
-    document.getElementById("email-detail").hidden = true;
-  });
+  document.getElementById("email-detail-close").addEventListener("click", () => { document.getElementById("email-detail").hidden = true; });
   document.getElementById("check-form").addEventListener("submit", runCheck);
-  document.getElementById("receipt-form").addEventListener("submit", createReceipt);
-  document.getElementById("receipt-detail-close").addEventListener("click", () => {
-    document.getElementById("receipt-detail").hidden = true;
-  });
+  document.getElementById("resend-verification").addEventListener("click", resendVerification);
+  document.getElementById("password-form").addEventListener("submit", changePassword);
+  document.getElementById("delete-form").addEventListener("submit", deleteAccount);
 
-  loadOverview();
+  state.pairCode = readPairCode();
+  try {
+    const response = await fetch("/auth/me", { credentials: "same-origin", cache: "no-store", headers: { accept: "application/json" } });
+    if (response.ok) {
+      await signedIn(await response.json());
+      return;
+    }
+  } catch {
+    // fall through to the sign-in view
+  }
+  signedOut();
+  if (state.pairCode) say("login-status", "Sign in to approve the browser extension.");
 });

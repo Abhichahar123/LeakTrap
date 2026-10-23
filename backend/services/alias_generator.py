@@ -37,7 +37,7 @@ class AliasGenerationError(Exception):
 class AliasConfig:
     domain: str | None
     prefix: str = ""
-    suffix_length: int = 4
+    suffix_length: int = 8
     max_retries: int = 5
 
     @classmethod

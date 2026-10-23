@@ -32,8 +32,5 @@ class AutofillSignup(BaseModel):
 
 class AutofillLookupResponse(BaseModel):
     site_domain: str
-    items: list[AutofillSignup] = Field(description="Exact-domain matches in this scope, newest first (max 10).")
-    note: str = (
-        "Exact domain match only; other subdomains are not included. Scope is a filter, "
-        "not authentication."
-    )
+    items: list[AutofillSignup] = Field(description="Your exact-domain matches, newest first (max 10).")
+    note: str = "Exact domain match only; other subdomains are not included."

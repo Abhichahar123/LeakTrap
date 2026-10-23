@@ -139,3 +139,39 @@ test("fill plan contains only ticked fields and marks replacements explicitly", 
   assert.throws(() => buildFillPlan(options, [], SIGNUP), /Tick at least one/);
   assert.throws(() => buildFillPlan(options, ["not-offered"], SIGNUP), /Tick at least one/);
 });
+
+// ---------- "Fill form on this page" target check ----------
+
+import { fillTargetCheck } from "../src/lib.js";
+
+const CREATED = { id: 9, siteName: "Shop", siteDomain: "shop.example.com", alias: "ab12@leaktrap.xyz", nickname: "Ocelot" };
+
+test("fill target: exact hostname only", () => {
+  assert.deepEqual(fillTargetCheck(CREATED, "shop.example.com"), { ok: true, reason: "" });
+  for (const host of ["example.com", "login.shop.example.com", "shop.example.co", "shop.example.com.evil.test", "other.example.com"]) {
+    const check = fillTargetCheck(CREATED, host);
+    assert.equal(check.ok, false, host);
+    assert.match(check.reason, /only fills a signup on its own site/);
+  }
+});
+
+test("fill target: unsupported tabs, missing domain or markers are refused with a reason", () => {
+  assert.match(fillTargetCheck(CREATED, null).reason, /not a website/);
+  assert.match(fillTargetCheck({ ...CREATED, siteDomain: null }, "shop.example.com").reason, /no website domain/);
+  assert.match(fillTargetCheck({ ...CREATED, alias: null, nickname: null }, "shop.example.com").reason, /no alias or nickname/);
+  assert.equal(fillTargetCheck(null, "shop.example.com").ok, false);
+});
+
+// ---------- detector summary shown when nothing qualifies ----------
+
+import { describeScanStats } from "../src/lib.js";
+
+test("scan summary explains what was skipped without values", () => {
+  assert.equal(describeScanStats({ inputs: 3, password: 1, phone: 1, unrecognized: 1 }),
+    "Checked 3 inputs: 1 password field (never filled), 1 phone-only field, 1 field not recognised as email or username.");
+  assert.equal(describeScanStats({ inputs: 0, unreadableFrames: 2 }),
+    "No input fields were found. 2 embedded frames come from another site, which LeakTrace cannot read.");
+  assert.equal(describeScanStats({ inputs: 1, hidden: 1 }), "Checked 1 input: 1 hidden or disabled input.");
+  assert.equal(describeScanStats(null), "No input fields were found.");
+  assert.equal(describeScanStats({ inputs: "3", password: -1 }), "No input fields were found.");
+});

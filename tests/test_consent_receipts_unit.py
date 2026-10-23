@@ -12,6 +12,7 @@ from sqlalchemy.exc import OperationalError
 
 from backend.database import get_db
 from backend.main import app
+from tests.auth_support import FAKE_HEADERS, fake_auth
 from backend.models.consent_receipt import CAPTURE_SOURCES, RECEIPT_ACTIONS
 from backend.routes.dashboard import DashboardConfig, get_dashboard_config
 from backend.schemas.consent_receipt import ConsentReceiptCreate, sha256_of
@@ -31,6 +32,7 @@ class BrokenSession:
 @pytest.fixture(autouse=True)
 def overrides():
     app.dependency_overrides[get_db] = lambda: None
+    fake_auth(app)
     app.dependency_overrides[get_dashboard_config] = lambda: DashboardConfig(enabled=True)
     yield
     app.dependency_overrides.clear()
@@ -38,7 +40,7 @@ def overrides():
 
 @pytest.fixture
 def local():
-    return TestClient(app, client=LOCAL)
+    return TestClient(app, client=LOCAL, headers=FAKE_HEADERS)
 
 
 def post(client, body, **kwargs):
@@ -115,7 +117,7 @@ def test_non_json_is_415(local) -> None:
 
 @pytest.mark.parametrize(
     "query", ["/consent-receipts?limit=0", "/consent-receipts?limit=101", "/consent-receipts?offset=-1",
-              "/consent-receipts?signup_id=0", "/consent-receipts?user_id=0", "/consent-receipts/0",
+              "/consent-receipts?signup_id=0", "/consent-receipts/0",
               "/consent-receipts/abc"],
 )
 def test_invalid_query_parameters_are_422(local, query) -> None:

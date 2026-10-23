@@ -1,5 +1,7 @@
-"""Response models for the local dashboard API. Aliases, nicknames, sender
-addresses, subjects and message hashes are deliberately absent."""
+"""Response models for the personal dashboard API (the signed-in user's own data).
+
+Full email senders, subjects, message hashes and bodies are never returned.
+"""
 
 from datetime import datetime
 
@@ -11,19 +13,17 @@ NOT_PROOF = (
 )
 
 
-class ScopeInfo(BaseModel):
-    user_id: int | None = Field(description="null means records that have no user.")
-    note: str = "Scope is a filter, not access control: there is no authentication yet."
-
-
 class OverviewResponse(BaseModel):
-    scope: ScopeInfo
-    signups_total: int
+    websites: int
+    aliases: int
+    nicknames: int
+    receipts: int
     emails_total: int
     matched: int
     ambiguous: int
     no_match: int
     unprocessed: int = Field(description="Mail records without a stored match status.")
+    investigations: int = Field(description="Matcher results you chose to record.")
     notice: str = NOT_PROOF
 
 
@@ -33,16 +33,15 @@ class DashboardSignup(BaseModel):
     id: int
     site_name: str
     site_domain: str | None
-    alias_masked: str | None = Field(description="Only the alias domain, e.g. •••@leaktrap.xyz.")
-    has_nickname: bool
-    has_surname_variant: bool
+    alias: str | None
+    nickname: str | None
     real_name_required: bool
+    receipt_count: int
     email_count: int
     created_at: datetime
 
 
 class DashboardSignupPage(BaseModel):
-    scope: ScopeInfo
     items: list[DashboardSignup]
     total: int
     limit: int
@@ -65,7 +64,6 @@ class DashboardEmail(BaseModel):
 
 
 class DashboardEmailPage(BaseModel):
-    scope: ScopeInfo
     items: list[DashboardEmail]
     total: int
     limit: int
@@ -78,4 +76,51 @@ class DashboardEmailDetail(DashboardEmail):
         "explanations are produced when the matcher runs; use the matcher check to see them."
     )
     limitations: list[str]
+    notice: str = NOT_PROOF
+
+
+class SignupReceipt(BaseModel):
+    id: int
+    action: str | None
+    evidence_basis: str
+    recorded_at: datetime
+    reported_occurred_at: datetime | None
+    source_url: str | None
+
+
+class SignupDetailResponse(BaseModel):
+    id: int
+    site_name: str
+    site_domain: str | None
+    alias: str | None
+    nickname: str | None
+    surname_variant: str | None
+    real_name_required: bool
+    real_name_used: bool
+    created_at: datetime
+    receipts: list[SignupReceipt] = Field(description="Most recent 20.")
+    emails: list[DashboardEmail] = Field(description="Most recent 20.")
+    notice: str = NOT_PROOF
+
+
+class Investigation(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    created_at: datetime
+    channel: str
+    result: str | None = Field(description='"matched", "ambiguous" or "no_match"; never a confirmed leak.')
+    confidence: str | None
+    matched_site: str | None
+    recipient_alias_matched: bool
+    sender_domain: str | None
+    candidate_count: int
+    signal_types: list[str]
+
+
+class InvestigationPage(BaseModel):
+    items: list[Investigation]
+    total: int
+    limit: int
+    offset: int
     notice: str = NOT_PROOF
