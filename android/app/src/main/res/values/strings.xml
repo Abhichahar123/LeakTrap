@@ -1,0 +1,12 @@
+<resources>
+    <string name="app_name">LeakTrace</string>
+    <string name="home_tagline">Find out who leaked your email address.</string>
+    <string name="home_body">LeakTrace gives every service you sign up for its own alias, so you can trace spam and data leaks back to their source.</string>
+    <string name="home_status_title">Foundation build</string>
+    <string name="home_status_body">This is the native Android foundation. Account sign-in, aliases and leak reports are not available in the app yet.</string>
+    <string name="home_open_about">About LeakTrace</string>
+    <string name="about_title">About</string>
+    <string name="about_version">Version %1$s</string>
+    <string name="about_body">LeakTrace for Android is under active development.</string>
+    <string name="navigate_back">Back</string>
+</resources>

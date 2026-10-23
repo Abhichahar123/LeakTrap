@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Envelope with a trace dot: a placeholder LeakTrace mark inside the 108dp adaptive-icon canvas. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="@android:color/transparent"
+        android:strokeColor="@color/leaktrace_launcher_foreground"
+        android:strokeWidth="4"
+        android:strokeLineJoin="round"
+        android:pathData="M34,40h40v28h-40z" />
+    <path
+        android:fillColor="@android:color/transparent"
+        android:strokeColor="@color/leaktrace_launcher_foreground"
+        android:strokeWidth="4"
+        android:strokeLineJoin="round"
+        android:strokeLineCap="round"
+        android:pathData="M34,40l20,16l20,-16" />
+    <path
+        android:fillColor="@color/leaktrace_launcher_foreground"
+        android:pathData="M74,68m-6,0a6,6 0,1 1,12 0a6,6 0,1 1,-12 0" />
+</vector>
